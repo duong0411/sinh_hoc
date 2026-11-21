@@ -18,12 +18,15 @@ class BioProvider extends ChangeNotifier {
     _mqtt = MqttService();
     _sub = _mqtt.messages.listen(_onMessage);
     _restore();
+    _staleTimer = Timer.periodic(const Duration(seconds: 5), (_) => _checkStale());
   }
 
   static const int historyMax = 60;
+  static const Duration liveWindow = Duration(seconds: 20);
 
   late final MqttService _mqtt;
   StreamSubscription<Map<String, dynamic>>? _sub;
+  Timer? _staleTimer;
 
   double? temp;
   double? humi;
@@ -41,14 +44,27 @@ class BioProvider extends ChangeNotifier {
 
   bool get hasTelemetry => temp != null || humi != null || co2 != null;
 
+  /// LIVE thật sự: ESP báo online HOẶC vừa có telemetry < 20s
+  bool get isLive {
+    if (!mqttConnected) return false;
+    if (deviceOnline) return true;
+    if (lastUpdate == null) return false;
+    return DateTime.now().difference(lastUpdate!) <= liveWindow;
+  }
+
+  bool get isStaleData {
+    if (!hasTelemetry || lastUpdate == null) return false;
+    return DateTime.now().difference(lastUpdate!) > liveWindow;
+  }
+
   String get friendlyStatus {
     if (connecting) return 'Đang kết nối MQTT...';
     if (!mqttConnected) return error ?? 'Mất kết nối MQTT';
-    if (!deviceOnline && !hasTelemetry) {
-      return 'MQTT OK — chờ ESP32 (chip ${AppConfig.chipId})';
+    if (isLive) return 'Trực tiếp · chip ${AppConfig.chipId}';
+    if (hasTelemetry) {
+      return 'ESP32 offline — đang hiện dữ liệu cũ (retain)';
     }
-    if (!deviceOnline) return 'ESP32 offline — hiển thị dữ liệu gần nhất';
-    return 'Trực tiếp · chip ${AppConfig.chipId}';
+    return 'MQTT OK — chờ ESP32 (chip ${AppConfig.chipId})';
   }
 
   Future<void> _restore() async {
@@ -96,6 +112,20 @@ class BioProvider extends ChangeNotifier {
 
   Future<void> reconnect() => connect(force: true);
 
+  void _checkStale() {
+    // Cập nhật nhãn LIVE/cũ mỗi 5s
+    if (hasTelemetry || mqttConnected) {
+      notifyListeners();
+    }
+    // Không thấy telemetry mới lâu → reconnect MQTT app
+    if (mqttConnected &&
+        lastUpdate != null &&
+        DateTime.now().difference(lastUpdate!) > const Duration(seconds: 45)) {
+      if (kDebugMode) print('BioProvider: stale telemetry → reconnect');
+      reconnect();
+    }
+  }
+
   void _pushHistory(ListQueue<SensorPoint> q, double value) {
     q.addLast(SensorPoint(DateTime.now(), value));
     while (q.length > historyMax) {
@@ -108,6 +138,7 @@ class BioProvider extends ChangeNotifier {
     final payload = (msg['payload'] as String? ?? '').trim();
 
     if (topic == AppConfig.topicOnline) {
+      // Chỉ tin topic online/offline — không đoán từ telemetry retain
       deviceOnline = payload.toLowerCase() == 'online';
       notifyListeners();
       return;
@@ -130,13 +161,13 @@ class BioProvider extends ChangeNotifier {
     }
 
     lastUpdate = DateTime.now();
-    deviceOnline = true;
     notifyListeners();
   }
 
   String get co2Label {
     final v = co2;
     if (v == null) return 'Chờ dữ liệu';
+    if (isStaleData) return 'Dữ liệu cũ';
     if (v < 800) return 'Tốt';
     if (v < 1200) return 'Trung bình';
     if (v < 2000) return 'Cao — nên thông gió';
@@ -145,6 +176,7 @@ class BioProvider extends ChangeNotifier {
 
   @override
   void dispose() {
+    _staleTimer?.cancel();
     _sub?.cancel();
     _mqtt.dispose();
     super.dispose();

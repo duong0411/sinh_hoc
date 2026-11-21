@@ -14,7 +14,7 @@ class HomePage extends StatelessWidget {
   Widget build(BuildContext context) {
     final bio = context.watch<BioProvider>();
     final size = MediaQuery.sizeOf(context);
-    final live = bio.mqttConnected && bio.deviceOnline;
+    final live = bio.isLive;
 
     return Scaffold(
       body: Container(

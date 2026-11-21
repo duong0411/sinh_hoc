@@ -54,12 +54,15 @@ class MqttService {
     _client = client;
     client.useWebSocket = true;
     client.websocketProtocols = MqttClientConstants.protocolsSingleDefault;
-    client.logging(on: false);
+    client.logging(on: kDebugMode);
     client.setProtocolV311();
-    client.keepAlivePeriod = 60;
-    client.connectTimeoutPeriod = 15000;
+    client.keepAlivePeriod = 20;
+    client.connectTimeoutPeriod = 20000;
     client.autoReconnect = true;
     client.resubscribeOnAutoReconnect = true;
+
+    // Listen TRƯỚC connect — không bỏ lỡ retained messages
+    _listen();
 
     client.onConnected = () {
       _isConnected = true;
@@ -75,13 +78,14 @@ class MqttService {
       _isConnected = true;
       _listen();
       _subscribeAll();
+      if (kDebugMode) print('MQTT: auto-reconnected');
     };
 
     client.connectionMessage =
         MqttConnectMessage().withClientIdentifier(clientId).startClean();
 
     try {
-      await client.connect().timeout(const Duration(seconds: 18));
+      await client.connect().timeout(const Duration(seconds: 22));
     } catch (e) {
       lastError = e.toString();
       _isConnected = false;
@@ -100,6 +104,9 @@ class MqttService {
       return false;
     }
 
+    // Subscribe thêm lần nữa sau khi socket ổn định
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    _subscribeAll();
     return true;
   }
 
@@ -107,7 +114,8 @@ class MqttService {
     final client = _client;
     if (client == null) return;
     for (final topic in AppConfig.subscribeTopics) {
-      client.subscribe(topic, MqttQos.atMostOnce);
+      client.subscribe(topic, MqttQos.atLeastOnce);
+      if (kDebugMode) print('MQTT: sub $topic');
     }
   }
 
@@ -121,7 +129,10 @@ class MqttService {
         final topic = event.topic;
         final payload =
             MqttPublishPayload.bytesToStringAsString(rec.payload.message);
-        _messageController.add({'topic': topic, 'payload': payload});
+        if (kDebugMode) print('MQTT: $topic <= $payload');
+        if (!_messageController.isClosed) {
+          _messageController.add({'topic': topic, 'payload': payload});
+        }
       }
     });
   }
