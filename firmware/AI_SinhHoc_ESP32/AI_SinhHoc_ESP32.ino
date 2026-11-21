@@ -347,9 +347,13 @@ void readSensors() {
     }
   }
 
-  if (ensOk && ens160.checkDataStatus()) {
-    bioCo2 = ens160.getECO2();
-    if (bioCo2 < 400) bioCo2 = 400;  // sàn eCO2 điển hình
+  // Luôn lấy eCO2 hiện tại để OLED và MQTT cùng một số
+  if (ensOk) {
+    ens160.checkDataStatus();
+    uint16_t c = ens160.getECO2();
+    if (c > 0) {
+      bioCo2 = c < 400 ? 400 : c;
+    }
   }
 
   Serial.printf("T=%.1fC H=%.0f%% CO2=%u ppm\n",
@@ -436,27 +440,28 @@ void drawOled() {
 }
 
 // ── MQTT ─────────────────────────────────────────────────────
-void mqttPub(const char* device, const String& payload, bool retain = true) {
+// Telemetry: QoS1 + retain để broker/app luôn nhận đúng số OLED hiện tại
+void mqttPub(const char* device, const String& payload, bool retain, uint8_t qos) {
   if (!mqttClient.isConnected()) return;
   String topic = String("tele/") + device + "/status";
-  mqttClient.publish(topic, payload, retain, 0);
+  mqttClient.publish(topic, payload, retain, qos);
 }
 
-void pubOnline() { mqttPub(CHIP_ID, "online", true); }
+void pubOnline() { mqttPub(CHIP_ID, "online", true, 1); }
 
 void pubTemp() {
   if (isnan(bioTemp)) return;
-  mqttPub(DEV_TEMP, "{\"value\":" + String(bioTemp, 1) + "}", true);
+  mqttPub(DEV_TEMP, "{\"value\":" + String(bioTemp, 1) + "}", true, 1);
 }
 
 void pubHumi() {
   if (isnan(bioHum)) return;
-  mqttPub(DEV_HUMI, "{\"value\":" + String(bioHum, 1) + "}", true);
+  mqttPub(DEV_HUMI, "{\"value\":" + String(bioHum, 1) + "}", true, 1);
 }
 
 void pubCo2() {
   if (bioCo2 == 0) return;
-  mqttPub(DEV_CO2, "{\"value\":" + String(bioCo2) + "}", true);
+  mqttPub(DEV_CO2, "{\"value\":" + String(bioCo2) + "}", true, 1);
 }
 
 void pubAll() {
@@ -880,14 +885,15 @@ void loop() {
     reconnectMQTT();
   }
 
+  // Cùng một vòng đọc → OLED + MQTT cùng số (tránh app giữ retain cũ)
   if (now - tRead >= READ_MS) {
     tRead = now;
     readSensors();
-  }
-
-  if (now - lastTelemetry >= TELEMETRY_MS) {
-    lastTelemetry = now;
-    pubAll();
+    if (mqttClient.isConnected()) {
+      pubAll();
+      lastTelemetry = now;
+      Serial.printf("[MQTT] sync OLED CO2=%u\n", (unsigned)bioCo2);
+    }
   }
 
   if (now - lastHeartbeat >= HEARTBEAT_MS) {

@@ -25,7 +25,7 @@ class SensorChartsSection extends StatelessWidget {
         ),
         const SizedBox(height: 6),
         Text(
-          'Đồng bộ với số đo phía trên · tối đa ${BioProvider.historyMax} mẫu',
+          'Lịch sử thưa (~15s/mẫu) · số đo phía trên là realtime',
           style: TextStyle(
             fontSize: 12.5,
             color: BioTheme.soft.withValues(alpha: 0.65),

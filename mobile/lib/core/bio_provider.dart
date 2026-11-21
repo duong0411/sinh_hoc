@@ -22,7 +22,9 @@ class BioProvider extends ChangeNotifier {
   }
 
   static const int historyMax = 60;
-  static const Duration liveWindow = Duration(seconds: 20);
+  /// Chart chỉ lấy mẫu thưa — không cần realtime
+  static const Duration chartSampleEvery = Duration(seconds: 15);
+  static const Duration liveWindow = Duration(seconds: 12);
 
   late final MqttService _mqtt;
   StreamSubscription<Map<String, dynamic>>? _sub;
@@ -42,18 +44,20 @@ class BioProvider extends ChangeNotifier {
   final ListQueue<SensorPoint> humiHistory = ListQueue();
   final ListQueue<SensorPoint> co2History = ListQueue();
 
+  DateTime? _lastChartTemp;
+  DateTime? _lastChartHumi;
+  DateTime? _lastChartCo2;
+
   bool get hasTelemetry => temp != null || humi != null || co2 != null;
 
-  /// LIVE thật sự: ESP báo online HOẶC vừa có telemetry < 20s
+  /// LIVE chỉ khi vừa nhận telemetry thật (khớp OLED), không chỉ vì retain/online
   bool get isLive {
-    if (!mqttConnected) return false;
-    if (deviceOnline) return true;
-    if (lastUpdate == null) return false;
+    if (!mqttConnected || lastUpdate == null) return false;
     return DateTime.now().difference(lastUpdate!) <= liveWindow;
   }
 
   bool get isStaleData {
-    if (!hasTelemetry || lastUpdate == null) return false;
+    if (!hasTelemetry || lastUpdate == null) return true;
     return DateTime.now().difference(lastUpdate!) > liveWindow;
   }
 
@@ -61,13 +65,13 @@ class BioProvider extends ChangeNotifier {
     if (connecting) return 'Đang kết nối MQTT...';
     if (!mqttConnected) return error ?? 'Mất kết nối MQTT';
     if (isLive) return 'Trực tiếp · chip ${AppConfig.chipId}';
+    if (deviceOnline) return 'ESP online — đang chờ số đo mới';
     if (hasTelemetry) {
       return 'ESP32 offline — đang hiện dữ liệu cũ (retain)';
     }
     return 'MQTT OK — chờ ESP32 (chip ${AppConfig.chipId})';
   }
 
-  /// Nhãn thời gian cập nhật — tick mỗi 1s để cảm giác realtime
   String get lastUpdateLabel {
     if (lastUpdate == null) return '';
     final s = DateTime.now().difference(lastUpdate!).inSeconds;
@@ -98,6 +102,12 @@ class BioProvider extends ChangeNotifier {
     AppConfig.setChipId(chipId);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('chipId', AppConfig.chipId);
+    _clearTelemetry();
+    notifyListeners();
+    await connect(force: true);
+  }
+
+  void _clearTelemetry() {
     temp = null;
     humi = null;
     co2 = null;
@@ -106,8 +116,9 @@ class BioProvider extends ChangeNotifier {
     tempHistory.clear();
     humiHistory.clear();
     co2History.clear();
-    notifyListeners();
-    await connect(force: true);
+    _lastChartTemp = null;
+    _lastChartHumi = null;
+    _lastChartCo2 = null;
   }
 
   Future<void> connect({bool force = false}) async {
@@ -124,6 +135,8 @@ class BioProvider extends ChangeNotifier {
       status = 'Lỗi MQTT';
     } else {
       status = 'Đã kết nối';
+      // Sau reconnect: không tin số cũ — chờ bản tin mới từ ESP (cùng OLED)
+      lastUpdate = null;
     }
     notifyListeners();
   }
@@ -134,18 +147,31 @@ class BioProvider extends ChangeNotifier {
     if (hasTelemetry || mqttConnected) {
       notifyListeners();
     }
-    // Không thấy telemetry mới lâu → reconnect MQTT app
     if (mqttConnected &&
         lastUpdate != null &&
-        DateTime.now().difference(lastUpdate!) > const Duration(seconds: 45)) {
-      if (kDebugMode) print('BioProvider: stale telemetry → reconnect');
+        DateTime.now().difference(lastUpdate!) > const Duration(seconds: 20)) {
+      if (kDebugMode) print('BioProvider: no fresh telemetry → reconnect');
       reconnect();
     }
   }
 
-  void _pushHistory(ListQueue<SensorPoint> q, double value) {
-    // Đồng bộ timeline: luôn ghi mẫu mới (kể cả trùng giá trị) để chart chạy realtime
-    q.addLast(SensorPoint(DateTime.now(), value));
+  void _pushHistorySparse(
+    ListQueue<SensorPoint> q,
+    double value,
+    DateTime? lastAt,
+    void Function(DateTime) setLast,
+  ) {
+    final now = DateTime.now();
+    if (lastAt != null && now.difference(lastAt) < chartSampleEvery) {
+      // Cập nhật điểm cuối cho khớp số live, không thêm mẫu realtime
+      if (q.isNotEmpty) {
+        q.removeLast();
+        q.addLast(SensorPoint(now, value));
+      }
+      return;
+    }
+    setLast(now);
+    q.addLast(SensorPoint(now, value));
     while (q.length > historyMax) {
       q.removeFirst();
     }
@@ -156,24 +182,45 @@ class BioProvider extends ChangeNotifier {
     final payload = (msg['payload'] as String? ?? '').trim();
 
     if (topic == AppConfig.topicOnline) {
-      // Chỉ tin topic online/offline — không đoán từ telemetry retain
-      deviceOnline = payload.toLowerCase() == 'online';
-      notifyListeners();
+      final online = payload.toLowerCase() == 'online';
+      deviceOnline = online;
+      if (!online) {
+        // Offline: giữ số cuối nhưng đánh stale
+        notifyListeners();
+      } else {
+        notifyListeners();
+      }
       return;
     }
 
     final value = MqttService.parseValue(payload);
     if (value == null) return;
 
+    // Luôn cập nhật số đo realtime (ưu tiên khớp OLED)
     if (topic == AppConfig.topicTemp) {
       temp = value;
-      _pushHistory(tempHistory, value);
+      _pushHistorySparse(
+        tempHistory,
+        value,
+        _lastChartTemp,
+        (t) => _lastChartTemp = t,
+      );
     } else if (topic == AppConfig.topicHumi) {
       humi = value;
-      _pushHistory(humiHistory, value);
+      _pushHistorySparse(
+        humiHistory,
+        value,
+        _lastChartHumi,
+        (t) => _lastChartHumi = t,
+      );
     } else if (topic == AppConfig.topicCo2) {
       co2 = value;
-      _pushHistory(co2History, value);
+      _pushHistorySparse(
+        co2History,
+        value,
+        _lastChartCo2,
+        (t) => _lastChartCo2 = t,
+      );
     } else {
       return;
     }
