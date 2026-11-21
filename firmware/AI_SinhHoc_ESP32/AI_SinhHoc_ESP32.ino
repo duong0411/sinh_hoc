@@ -440,28 +440,28 @@ void drawOled() {
 }
 
 // ── MQTT ─────────────────────────────────────────────────────
-// Telemetry: QoS1 + retain để broker/app luôn nhận đúng số OLED hiện tại
-void mqttPub(const char* device, const String& payload, bool retain, uint8_t qos) {
+// QoS0 + retain — QoS1 làm MQTTPubSubClient/WSS dễ drop sau pub (app lệch OLED)
+void mqttPub(const char* device, const String& payload, bool retain = true) {
   if (!mqttClient.isConnected()) return;
   String topic = String("tele/") + device + "/status";
-  mqttClient.publish(topic, payload, retain, qos);
+  mqttClient.publish(topic, payload, retain, 0);
 }
 
-void pubOnline() { mqttPub(CHIP_ID, "online", true, 1); }
+void pubOnline() { mqttPub(CHIP_ID, "online", true); }
 
 void pubTemp() {
   if (isnan(bioTemp)) return;
-  mqttPub(DEV_TEMP, "{\"value\":" + String(bioTemp, 1) + "}", true, 1);
+  mqttPub(DEV_TEMP, "{\"value\":" + String(bioTemp, 1) + "}", true);
 }
 
 void pubHumi() {
   if (isnan(bioHum)) return;
-  mqttPub(DEV_HUMI, "{\"value\":" + String(bioHum, 1) + "}", true, 1);
+  mqttPub(DEV_HUMI, "{\"value\":" + String(bioHum, 1) + "}", true);
 }
 
 void pubCo2() {
   if (bioCo2 == 0) return;
-  mqttPub(DEV_CO2, "{\"value\":" + String(bioCo2) + "}", true, 1);
+  mqttPub(DEV_CO2, "{\"value\":" + String(bioCo2) + "}", true);
 }
 
 void pubAll() {
@@ -476,42 +476,20 @@ bool mqttNeedConnect = false;
 void startMqttStack() {
   if (mqttStarted) return;
   Serial.printf("[WSS] beginSSL %s:%d%s\n", MQTT_HOST, MQTT_PORT, MQTT_PATH);
-  // fingerprint NULL → thư viện gọi setInsecure() (ESP32)
-  wsClient.beginSSL(MQTT_HOST, MQTT_PORT, MQTT_PATH);
+  // Header TRƯỚC begin — bắt buộc để subprotocol mqtt
   wsClient.setExtraHeaders("Sec-WebSocket-Protocol: mqtt");
   wsClient.setReconnectInterval(3000);
   wsClient.enableHeartbeat(15000, 4000, 2);
-  wsClient.onEvent([](WStype_t type, uint8_t* payload, size_t length) {
-    (void)payload;
-    (void)length;
-    switch (type) {
-      case WStype_DISCONNECTED:
-        wssReady = false;
-        mqttLoggedOk = false;
-        mqttNeedConnect = false;
-        Serial.println(F("[WSS] DISCONNECTED"));
-        break;
-      case WStype_CONNECTED:
-        wssReady = true;
-        mqttNeedConnect = true;  // connect MQTT trong loop, không trong callback
-        lastMqttRetry = 0;
-        Serial.println(F("[WSS] CONNECTED"));
-        break;
-      case WStype_ERROR:
-        wssReady = false;
-        Serial.println(F("[WSS] ERROR"));
-        break;
-      default:
-        break;
-    }
-  });
+  wsClient.beginSSL(MQTT_HOST, MQTT_PORT, MQTT_PATH);
+  // begin() gắn onEvent nhận BIN MQTT — để SAU cùng, không ghi đè
   mqttClient.begin(wsClient);
   mqttClient.setTimeout(15000);
   mqttClient.setKeepAliveTimeout(20);
   mqttClient.setKeepAliveSendInterval(8000);
   mqttStarted = true;
   wssReady = false;
-  mqttNeedConnect = false;
+  mqttNeedConnect = true;
+  mqttLoggedOk = false;
 }
 
 void stopMqttStack() {
@@ -533,13 +511,14 @@ void reconnectMQTT() {
     return;
   }
   Serial.print(F("MQTT WSS ... "));
-  // ClientId unique mỗi lần — tránh broker đá session cũ
   String clientId = String("ESP32-BIO-") + String((uint32_t)ESP.getEfuseMac(), HEX) +
                     "-" + String((uint32_t)millis(), HEX);
   String lwt = String("tele/") + CHIP_ID + "/status";
   mqttClient.setWill(lwt, "offline", true, 1);
   if (!mqttClient.connect(clientId, "", "")) {
-    Serial.println(F("fail"));
+    Serial.printf("fail err=%d rc=%d\n",
+                  (int)mqttClient.getLastError(),
+                  (int)mqttClient.getReturnCode());
     mqttLoggedOk = false;
     return;
   }
@@ -549,7 +528,7 @@ void reconnectMQTT() {
   pubOnline();
   delay(40);
   pubAll();
-  Serial.println(F("[MQTT] pub tele/800_*/status"));
+  Serial.printf("[MQTT] live CO2=%u -> tele/800_co2/status\n", (unsigned)bioCo2);
 }
 
 // ── Captive portal ───────────────────────────────────────────
@@ -841,18 +820,24 @@ void loop() {
   }
 
   unsigned long now = millis();
+  static uint32_t wifiDownSince = 0;
 
   if (WiFi.status() != WL_CONNECTED) {
-    if (mqttStarted) stopMqttStack();
-    if (now - lastReconnect >= RECONNECT_MS) {
-      lastReconnect = now;
-      if (connectBestWifi()) {
-        wifiRetries = 0;
-        startMqttStack();
-      } else if (++wifiRetries >= 2) {
-        Serial.println(F("[WiFi] Mat mang — mo Portal de cau hinh lai"));
-        wifiRetries = 0;
-        startPortal();
+    if (wifiDownSince == 0) wifiDownSince = now;
+    // Debounce 5s — tránh WiFi status nháy làm cắt MQTT (OLED vẫn chạy, app kẹt retain)
+    if (now - wifiDownSince >= 5000) {
+      if (mqttStarted) stopMqttStack();
+      if (now - lastReconnect >= RECONNECT_MS) {
+        lastReconnect = now;
+        if (connectBestWifi()) {
+          wifiRetries = 0;
+          wifiDownSince = 0;
+          startMqttStack();
+        } else if (++wifiRetries >= 2) {
+          Serial.println(F("[WiFi] Mat mang — mo Portal de cau hinh lai"));
+          wifiRetries = 0;
+          startPortal();
+        }
       }
     }
     if (now - tRead >= READ_MS) {
@@ -865,6 +850,7 @@ void loop() {
     }
     return;
   }
+  wifiDownSince = 0;
   wifiRetries = 0;
 
   if (!mqttStarted) startMqttStack();
@@ -875,17 +861,17 @@ void loop() {
   if (!wssReady && wsClient.isConnected()) {
     wssReady = true;
     lastMqttRetry = 0;
+    Serial.println(F("[WSS] CONNECTED"));
   }
   if (mqttStarted && !wsClient.isConnected()) wssReady = false;
 
-  // MQTT CONNECT khi WSS vừa lên hoặc bị rớt
   if (wssReady && (mqttNeedConnect || !mqttClient.isConnected()) &&
       now - lastMqttRetry >= 2500) {
     lastMqttRetry = now;
     reconnectMQTT();
   }
 
-  // Cùng một vòng đọc → OLED + MQTT cùng số (tránh app giữ retain cũ)
+  // Cùng vòng đọc → OLED + MQTT cùng số
   if (now - tRead >= READ_MS) {
     tRead = now;
     readSensors();
