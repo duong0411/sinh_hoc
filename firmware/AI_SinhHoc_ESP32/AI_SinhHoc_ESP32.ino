@@ -424,30 +424,50 @@ function conn(){
 </script></body></html>
 )rawhtml";
 
-void handleNotFound() {
-  webServer.sendHeader("Location", "http://192.168.4.1/", true);
-  webServer.send(302, "text/plain", "");
-}
 void handleRoot() { webServer.send_P(200, "text/html", PORTAL_HTML); }
 
+// Captive portal: nhiều máy Android/iOS chỉ mở trang setup khi probe trả HTML/204 đúng
+void handleCaptiveProbe() {
+  // Trả portal HTML (200) — ổn định hơn 302 trên một số ROM/iOS
+  webServer.send_P(200, "text/html", PORTAL_HTML);
+}
+
+void handleNotFound() {
+  // Vẫn redirect + fallback HTML nếu client không theo Location
+  webServer.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  webServer.sendHeader("Location", "http://192.168.4.1/", true);
+  webServer.send_P(302, "text/html", PORTAL_HTML);
+}
+
 void handleScan() {
-  // Bật tạm AP+STA để scan, rồi về AP thuần (tránh làm rớt portal)
+  // Giữ AP, bật thêm STA chỉ để scan — rồi về AP thuần
   WiFi.mode(WIFI_AP_STA);
-  delay(40);
-  int n = WiFi.scanNetworks(false, false, false, 120);
+  delay(80);
+  // async=false, show_hidden=false; timeout ms tùy SDK
+  int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false);
   String json = "[";
   if (n > 0) {
-    for (int i = 0; i < n; i++) {
+    // Giới hạn 24 mạng — JSON nhỏ, portal không treo
+    int lim = n > 24 ? 24 : n;
+    for (int i = 0; i < lim; i++) {
       if (i) json += ',';
       String ssid = WiFi.SSID(i);
       ssid.replace("\\", "\\\\");
       ssid.replace("\"", "\\\"");
       json += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
     }
-    WiFi.scanDelete();
   }
+  WiFi.scanDelete();
   json += "]";
+  // Khôi phục AP + cấu hình IP (một số board mất softAPConfig sau AP_STA)
   WiFi.mode(WIFI_AP);
+  delay(30);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  if (WiFi.softAPIP() != apIP) {
+    WiFi.softAP(AP_SSID, nullptr, 1, 0, 4);
+    WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  }
+  webServer.sendHeader("Cache-Control", "no-cache");
   webServer.send(200, "application/json", json);
 }
 
@@ -520,6 +540,17 @@ void startPortal() {
   webServer.on("/", HTTP_GET, handleRoot);
   webServer.on("/scan", HTTP_GET, handleScan);
   webServer.on("/connect", HTTP_POST, handleConnect);
+  // Android captive
+  webServer.on("/generate_204", HTTP_GET, handleCaptiveProbe);
+  webServer.on("/gen_204", HTTP_GET, handleCaptiveProbe);
+  webServer.on("/connecttest.txt", HTTP_GET, handleCaptiveProbe);
+  // Windows NCSI
+  webServer.on("/ncsi.txt", HTTP_GET, handleCaptiveProbe);
+  webServer.on("/fwlink/", HTTP_GET, handleCaptiveProbe);
+  // iOS / macOS captive
+  webServer.on("/hotspot-detect.html", HTTP_GET, handleCaptiveProbe);
+  webServer.on("/library/test/success.html", HTTP_GET, handleCaptiveProbe);
+  webServer.on("/canonical.html", HTTP_GET, handleCaptiveProbe);
   webServer.onNotFound(handleNotFound);
   webServer.begin();
 

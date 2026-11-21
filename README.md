@@ -29,13 +29,21 @@ flutter run
 
 Workflow: `.github/workflows/release.yml`
 
-- Push tag `v*` (vd: `v1.0.0`) **hoặc** chạy tay **Actions → Build & Release → Run workflow**
-- Build **APK** (Android) + **IPA** (iOS, unsigned — sideload bằng Sideloadly/AltStore)
-- Tự tạo **GitHub Release** kèm 2 file
+- Push tag `v*` (vd: `v1.0.2`) **hoặc** chạy tay **Actions → Build & Release → Run workflow**
+- Build **APK** (Android) + **IPA** (iOS, unsigned — Sideloadly/AltStore)
+- Release **chỉ tạo khi cả APK và IPA đều build OK** (tránh thiếu APK như v1.0.1)
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.0.2
+git push origin v1.0.2
 ```
 
-> IPA unsigned cần cài bằng Sideloadly (Windows) với Apple ID của bạn. Muốn signed IPA store thì thêm secrets signing Apple sau.
+APK build tay:
+
+```bash
+cd mobile
+flutter build apk --release --no-tree-shake-icons
+# → build/app/outputs/flutter-apk/app-release.apk
+```
+
+> IPA unsigned cài bằng Sideloadly (Windows) với Apple ID. Muốn IPA store thì thêm secrets signing Apple.
