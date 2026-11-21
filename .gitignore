@@ -1,0 +1,44 @@
+# Flutter / Dart
+mobile/.dart_tool/
+mobile/.flutter-plugins
+mobile/.flutter-plugins-dependencies
+mobile/.packages
+mobile/.pub-cache/
+mobile/.pub/
+mobile/build/
+mobile/.idea/
+mobile/*.iml
+mobile/**/Generated.xcconfig
+mobile/**/flutter_export_environment.sh
+mobile/android/.gradle/
+mobile/android/local.properties
+mobile/android/**/key.properties
+mobile/android/**/*.jks
+mobile/android/**/*.keystore
+mobile/ios/Pods/
+mobile/ios/.symlinks/
+mobile/ios/Flutter/Flutter.framework
+mobile/ios/Flutter/Flutter.podspec
+mobile/macos/Flutter/ephemeral/
+mobile/linux/flutter/ephemeral/
+mobile/windows/flutter/ephemeral/
+mobile/web/.dart_tool/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Arduino / PlatformIO
+.pio/
+**/build/
+*.elf
+*.bin
+*.map
+
+# Secrets
+.env
+.env.*
+**/credentials.json
