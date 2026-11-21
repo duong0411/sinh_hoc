@@ -63,29 +63,7 @@ class HomePage extends StatelessWidget {
                               onChangeDevice: () =>
                                   Navigator.of(context).pushNamed('/connect'),
                             ),
-                            SizedBox(height: size.height * 0.03),
-                            Text(
-                              'AI SINH HỌC',
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .displayMedium
-                                  ?.copyWith(
-                                    fontSize: size.width > 390 ? 44 : 36,
-                                  ),
-                            )
-                                .animate()
-                                .fadeIn(duration: 450.ms)
-                                .slideY(begin: 0.08, curve: Curves.easeOutCubic),
-                            const SizedBox(height: 8),
-                            Text(
-                              'Nhiệt độ · Độ ẩm · Nồng độ CO₂',
-                              style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                                    color: BioTheme.moss.withValues(alpha: 0.95),
-                                    fontSize: 15,
-                                    fontWeight: FontWeight.w500,
-                                  ),
-                            ).animate().fadeIn(delay: 60.ms),
-                            const SizedBox(height: 12),
+                            const SizedBox(height: 18),
                             Text(
                               bio.friendlyStatus,
                               style: Theme.of(context).textTheme.bodyMedium?.copyWith(
@@ -93,10 +71,10 @@ class HomePage extends StatelessWidget {
                                     color: BioTheme.soft.withValues(alpha: 0.75),
                                   ),
                             ),
-                            if (bio.lastUpdate != null) ...[
+                            if (bio.lastUpdateLabel.isNotEmpty) ...[
                               const SizedBox(height: 4),
                               Text(
-                                'Cập nhật ${_fmtTime(bio.lastUpdate!)}',
+                                bio.lastUpdateLabel,
                                 style: TextStyle(
                                   fontSize: 12,
                                   color: BioTheme.soft.withValues(alpha: 0.55),
@@ -111,11 +89,11 @@ class HomePage extends StatelessWidget {
                     // CO2 hero
                     SliverToBoxAdapter(
                       child: Padding(
-                        padding: const EdgeInsets.fromLTRB(24, 28, 24, 8),
+                        padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
                         child: _Co2Hero(
                           ppm: bio.co2,
                           label: bio.co2Label,
-                        ).animate().fadeIn(delay: 80.ms).slideY(begin: 0.06),
+                        ),
                       ),
                     ),
 
@@ -133,7 +111,7 @@ class HomePage extends StatelessWidget {
                                     : bio.temp!.toStringAsFixed(1),
                                 unit: '°C',
                                 accent: BioTheme.warn,
-                              ).animate().fadeIn(delay: 120.ms),
+                              ),
                             ),
                             const SizedBox(width: 14),
                             Expanded(
@@ -144,7 +122,7 @@ class HomePage extends StatelessWidget {
                                     : bio.humi!.toStringAsFixed(0),
                                 unit: '%',
                                 accent: BioTheme.leaf,
-                              ).animate().fadeIn(delay: 160.ms),
+                              ),
                             ),
                           ],
                         ),
@@ -155,10 +133,7 @@ class HomePage extends StatelessWidget {
                     SliverToBoxAdapter(
                       child: Padding(
                         padding: const EdgeInsets.fromLTRB(24, 20, 24, 40),
-                        child: SensorChartsSection(bio: bio)
-                            .animate()
-                            .fadeIn(delay: 200.ms)
-                            .slideY(begin: 0.04),
+                        child: SensorChartsSection(bio: bio),
                       ),
                     ),
                   ],
@@ -180,13 +155,6 @@ class HomePage extends StatelessWidget {
         color: color,
       ),
     );
-  }
-
-  static String _fmtTime(DateTime t) {
-    final h = t.hour.toString().padLeft(2, '0');
-    final m = t.minute.toString().padLeft(2, '0');
-    final s = t.second.toString().padLeft(2, '0');
-    return '$h:$m:$s';
   }
 }
 

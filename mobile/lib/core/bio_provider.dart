@@ -18,7 +18,7 @@ class BioProvider extends ChangeNotifier {
     _mqtt = MqttService();
     _sub = _mqtt.messages.listen(_onMessage);
     _restore();
-    _staleTimer = Timer.periodic(const Duration(seconds: 5), (_) => _checkStale());
+    _staleTimer = Timer.periodic(const Duration(seconds: 1), (_) => _checkStale());
   }
 
   static const int historyMax = 60;
@@ -67,6 +67,24 @@ class BioProvider extends ChangeNotifier {
     return 'MQTT OK — chờ ESP32 (chip ${AppConfig.chipId})';
   }
 
+  /// Nhãn thời gian cập nhật — tick mỗi 1s để cảm giác realtime
+  String get lastUpdateLabel {
+    if (lastUpdate == null) return '';
+    final s = DateTime.now().difference(lastUpdate!).inSeconds;
+    if (s <= 1) return 'Vừa cập nhật';
+    if (s < 60) return 'Cập nhật $s giây trước';
+    final m = s ~/ 60;
+    if (m < 60) return 'Cập nhật $m phút trước';
+    return 'Cập nhật lúc ${_fmtClock(lastUpdate!)}';
+  }
+
+  static String _fmtClock(DateTime t) {
+    final h = t.hour.toString().padLeft(2, '0');
+    final m = t.minute.toString().padLeft(2, '0');
+    final s = t.second.toString().padLeft(2, '0');
+    return '$h:$m:$s';
+  }
+
   Future<void> _restore() async {
     final prefs = await SharedPreferences.getInstance();
     final saved = prefs.getString('chipId');
@@ -113,7 +131,6 @@ class BioProvider extends ChangeNotifier {
   Future<void> reconnect() => connect(force: true);
 
   void _checkStale() {
-    // Cập nhật nhãn LIVE/cũ mỗi 5s
     if (hasTelemetry || mqttConnected) {
       notifyListeners();
     }
@@ -127,6 +144,7 @@ class BioProvider extends ChangeNotifier {
   }
 
   void _pushHistory(ListQueue<SensorPoint> q, double value) {
+    // Đồng bộ timeline: luôn ghi mẫu mới (kể cả trùng giá trị) để chart chạy realtime
     q.addLast(SensorPoint(DateTime.now(), value));
     while (q.length > historyMax) {
       q.removeFirst();
