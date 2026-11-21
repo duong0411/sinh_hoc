@@ -42,3 +42,9 @@ Thumbs.db
 .env
 .env.*
 **/credentials.json
+
+# Local build artifacts (release qua GitHub Actions)
+dist/
+*.apk
+*.ipa
+*.aab
