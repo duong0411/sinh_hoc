@@ -199,12 +199,14 @@ void startPortal();
 
 static bool wifiSsidOk(const char* ssid) {
   if (!ssid || !ssid[0]) return false;
-  // Bỏ entry EEPROM rác (ký tự không in được)
+  // Cho phép UTF-8 (SSID tiếng Việt). Chỉ loại control char / EEPROM toàn 0xFF.
+  bool any = false;
   for (int i = 0; i < 32 && ssid[i]; i++) {
-    char c = ssid[i];
-    if (c < 32 || c > 126) return false;
+    unsigned char c = (unsigned char)ssid[i];
+    if (c < 32) return false;
+    if (c != 0xFF) any = true;
   }
-  return true;
+  return any;
 }
 
 // ── EEPROM WiFi ──────────────────────────────────────────────
@@ -247,10 +249,14 @@ void loadWifiList() {
 }
 
 void addOrUpdateWifi(const String& ssid, const String& pass) {
+  // Đảm bảo null-terminated + không tràn (SSID max 32 byte kể cả '\0')
+  if (ssid.length() == 0 || ssid.length() > 32) return;
+
   for (int i = 0; i < wifiCount; i++) {
     if (ssid == wifiList[i].ssid) {
+      memset(wifiList[i].pass, 0, sizeof(wifiList[i].pass));
       pass.toCharArray(wifiList[i].pass, sizeof(wifiList[i].pass));
-      // Đưa mạng vừa cập nhật lên cuối (ưu tiên kết nối)
+      // Đưa mạng vừa cập nhật lên cuối (ưu tiên kết nối lần boot sau)
       if (i != wifiCount - 1) {
         WifiEntry tmp = wifiList[i];
         for (int j = i; j < wifiCount - 1; j++) wifiList[j] = wifiList[j + 1];
@@ -261,11 +267,13 @@ void addOrUpdateWifi(const String& ssid, const String& pass) {
     }
   }
   if (wifiCount < MAX_WIFI) {
+    memset(&wifiList[wifiCount], 0, sizeof(WifiEntry));
     ssid.toCharArray(wifiList[wifiCount].ssid, sizeof(wifiList[wifiCount].ssid));
     pass.toCharArray(wifiList[wifiCount].pass, sizeof(wifiList[wifiCount].pass));
     wifiCount++;
   } else {
     for (int i = 0; i < MAX_WIFI - 1; i++) wifiList[i] = wifiList[i + 1];
+    memset(&wifiList[MAX_WIFI - 1], 0, sizeof(WifiEntry));
     ssid.toCharArray(wifiList[MAX_WIFI - 1].ssid, sizeof(wifiList[MAX_WIFI - 1].ssid));
     pass.toCharArray(wifiList[MAX_WIFI - 1].pass, sizeof(wifiList[MAX_WIFI - 1].pass));
   }
@@ -368,10 +376,29 @@ static void oledPrintCenteredIn(Adafruit_GFX* g, int16_t x0, int16_t boxW, int16
   g->print(s);
 }
 
+void drawOledPortal() {
+  Adafruit_GFX* g = oledGfx();
+  if (!g) return;
+  oledClear();
+  g->setTextColor(SSD1306_WHITE);
+  oledPrintCentered(g, 4, 1, "CAI DAT WIFI");
+  g->drawFastHLine(16, 16, 96, SSD1306_WHITE);
+  oledPrintCentered(g, 24, 1, "Noi dien thoai:");
+  oledPrintCentered(g, 36, 2, "AI_SinhHoc");
+  oledPrintCentered(g, 56, 1, "192.168.4.1");
+  oledShow();
+}
+
 void drawOled() {
   if (!oledOk) return;
   Adafruit_GFX* g = oledGfx();
   if (!g) return;
+
+  // Portal: màn hướng dẫn rõ cho khách — không hiện số đo
+  if (portalActive) {
+    drawOledPortal();
+    return;
+  }
 
   oledClear();
   g->setTextColor(SSD1306_WHITE);
@@ -386,32 +413,24 @@ void drawOled() {
 
   // ══ HERO: CO2 ══════════════════════════════════════════════
   oledPrintCentered(g, 0, 1, "CO2");
-  // Số lớn — size 3 nếu <= 3 chữ số, size 2 nếu nhiều hơn
   uint8_t cSize = (strlen(cBuf) <= 3) ? 3 : 2;
   int16_t cY = (cSize == 3) ? 10 : 12;
   oledPrintCentered(g, cY, cSize, cBuf);
   oledPrintCentered(g, (cSize == 3) ? 36 : 30, 1, "ppm");
 
-  // Đường phân cách mềm (không full-bleed sát mép)
   g->drawFastHLine(10, 44, 108, SSD1306_WHITE);
 
-  // ══ TEMP | HUM ═════════════════════════════════════════════
-  // Cột trái
   oledPrintCenteredIn(g, 0, 63, 48, 1, "TEMP");
   char tLine[16];
   snprintf(tLine, sizeof(tLine), "%sC", tBuf);
   oledPrintCenteredIn(g, 0, 63, 56, 1, tLine);
 
-  // Cột phải
   oledPrintCenteredIn(g, 65, 63, 48, 1, "HUM");
   char hLine[16];
   snprintf(hLine, sizeof(hLine), "%s%%", hBuf);
   oledPrintCenteredIn(g, 65, 63, 56, 1, hLine);
 
-  // Vạch dọc nhẹ giữa 2 cột dưới
   g->drawFastVLine(64, 47, 15, SSD1306_WHITE);
-
-  if (portalActive) g->fillCircle(123, 3, 2, SSD1306_WHITE);
 
   oledShow();
 }
