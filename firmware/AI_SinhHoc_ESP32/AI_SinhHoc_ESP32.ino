@@ -51,7 +51,6 @@
 
 // ── WiFi portal ──────────────────────────────────────────────
 #define AP_SSID       "AI_SinhHoc"
-#define AP_PASSWORD   ""
 IPAddress apIP(192, 168, 4, 1);
 const byte DNS_PORT = 53;
 
@@ -98,10 +97,7 @@ bool ahtOk = false;
 bool oledOk = false;
 
 bool portalActive = false;
-bool pendingStaConnect = false;
-char pendingSsid[33] = {0};
-char pendingPass[65] = {0};
-unsigned long pendingStaAt = 0;
+bool pendingStaConnect = false;  // giữ tương thích (không dùng — connect = lưu + restart)
 
 unsigned long tRead = 0;
 unsigned long lastTelemetry = 0;
@@ -125,6 +121,17 @@ void drawOled();
 void pubAll();
 void pubOnline();
 void reconnectMQTT();
+void startPortal();
+
+static bool wifiSsidOk(const char* ssid) {
+  if (!ssid || !ssid[0]) return false;
+  // Bỏ entry EEPROM rác (ký tự không in được)
+  for (int i = 0; i < 32 && ssid[i]; i++) {
+    char c = ssid[i];
+    if (c < 32 || c > 126) return false;
+  }
+  return true;
+}
 
 // ── EEPROM WiFi ──────────────────────────────────────────────
 void saveWifiList() {
@@ -146,64 +153,98 @@ void loadWifiList() {
   int addr = sizeof(wifiCount);
   for (int i = 0; i < MAX_WIFI; i++) {
     EEPROM.get(addr, wifiList[i]);
+    wifiList[i].ssid[sizeof(wifiList[i].ssid) - 1] = '\0';
+    wifiList[i].pass[sizeof(wifiList[i].pass) - 1] = '\0';
     addr += sizeof(WifiEntry);
   }
   EEPROM.end();
+
+  // Lọc SSID rác / trống
+  int good = 0;
+  for (int i = 0; i < wifiCount; i++) {
+    if (!wifiSsidOk(wifiList[i].ssid)) continue;
+    if (good != i) wifiList[good] = wifiList[i];
+    good++;
+  }
+  if (good != wifiCount) {
+    wifiCount = good;
+    saveWifiList();
+  }
 }
 
-void addOrUpdateWifi(String ssid, String pass) {
+void addOrUpdateWifi(const String& ssid, const String& pass) {
   for (int i = 0; i < wifiCount; i++) {
-    if (String(wifiList[i].ssid) == ssid) {
+    if (ssid == wifiList[i].ssid) {
       pass.toCharArray(wifiList[i].pass, sizeof(wifiList[i].pass));
+      // Đưa mạng vừa cập nhật lên cuối (ưu tiên kết nối)
+      if (i != wifiCount - 1) {
+        WifiEntry tmp = wifiList[i];
+        for (int j = i; j < wifiCount - 1; j++) wifiList[j] = wifiList[j + 1];
+        wifiList[wifiCount - 1] = tmp;
+      }
       saveWifiList();
       return;
     }
   }
-  if (wifiCount >= MAX_WIFI) {
+  if (wifiCount < MAX_WIFI) {
+    ssid.toCharArray(wifiList[wifiCount].ssid, sizeof(wifiList[wifiCount].ssid));
+    pass.toCharArray(wifiList[wifiCount].pass, sizeof(wifiList[wifiCount].pass));
+    wifiCount++;
+  } else {
     for (int i = 0; i < MAX_WIFI - 1; i++) wifiList[i] = wifiList[i + 1];
-    wifiCount = MAX_WIFI - 1;
+    ssid.toCharArray(wifiList[MAX_WIFI - 1].ssid, sizeof(wifiList[MAX_WIFI - 1].ssid));
+    pass.toCharArray(wifiList[MAX_WIFI - 1].pass, sizeof(wifiList[MAX_WIFI - 1].pass));
   }
-  ssid.toCharArray(wifiList[wifiCount].ssid, sizeof(wifiList[wifiCount].ssid));
-  pass.toCharArray(wifiList[wifiCount].pass, sizeof(wifiList[wifiCount].pass));
-  wifiCount++;
   saveWifiList();
 }
 
-bool connectBestWifi() {
-  Serial.println(F("\nQuet WiFi..."));
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(false, false);
-  delay(100);
-  if (wifiCount == 0) return false;
-
-  int n = WiFi.scanNetworks();
-  int bestIdx = -1, bestRSSI = -999;
-  if (n > 0) {
-    for (int i = 0; i < n; i++) {
-      String scanned = WiFi.SSID(i);
-      int rssi = WiFi.RSSI(i);
-      for (int w = 0; w < wifiCount; w++) {
-        if (String(wifiList[w].ssid) == scanned && rssi > bestRSSI) {
-          bestRSSI = rssi;
-          bestIdx = w;
-        }
-      }
+// Chờ STA — thoát sớm nếu sai mật khẩu / không thấy SSID
+bool waitWifiConnected(uint16_t maxMs = 15000) {
+  const uint16_t step = 100;
+  uint16_t waited = 0;
+  while (waited < maxMs) {
+    wl_status_t st = WiFi.status();
+    if (st == WL_CONNECTED) return true;
+    if (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL) {
+      Serial.printf("\n[WiFi] fail status=%d\n", (int)st);
+      return false;
     }
-    WiFi.scanDelete();
+    delay(step);
+    waited += step;
+    if ((waited % 500) == 0) Serial.print('.');
   }
-  if (bestIdx < 0) bestIdx = wifiCount - 1;
+  return WiFi.status() == WL_CONNECTED;
+}
 
-  Serial.printf("Thu ket noi: %s\n", wifiList[bestIdx].ssid);
-  WiFi.begin(wifiList[bestIdx].ssid, wifiList[bestIdx].pass);
-  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
-    delay(250);
-    Serial.print('.');
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi OK " + WiFi.localIP().toString());
+bool tryWifiCreds(const char* ssid, const char* pass) {
+  if (!wifiSsidOk(ssid)) return false;
+  Serial.printf("[WiFi] STA begin '%s'\n", ssid);
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(200);
+  WiFi.begin(ssid, pass);
+  if (waitWifiConnected(15000)) {
+    Serial.println("\n[WiFi] OK IP: " + WiFi.localIP().toString());
     return true;
   }
-  Serial.println(F("\nWiFi fail"));
+  Serial.printf("\n[WiFi] FAIL status=%d\n", (int)WiFi.status());
+  WiFi.disconnect(true, true);
+  delay(100);
+  return false;
+}
+
+bool connectBestWifi() {
+  if (wifiCount <= 0) return false;
+
+  // Ưu tiên mạng mới nhất (vừa lưu từ portal) — không phụ thuộc scan
+  int last = wifiCount - 1;
+  if (tryWifiCreds(wifiList[last].ssid, wifiList[last].pass)) return true;
+
+  for (int w = last - 1; w >= 0; w--) {
+    if (tryWifiCreds(wifiList[w].ssid, wifiList[w].pass)) return true;
+  }
   return false;
 }
 
@@ -246,8 +287,8 @@ void drawOled() {
     oled.setCursor(90, 0);
     oled.print(mqttClient.isConnected() ? F("MQTT") : F("WiFi"));
   } else if (portalActive) {
-    oled.setCursor(78, 0);
-    oled.print(F("AP"));
+    oled.setCursor(64, 0);
+    oled.print(F("AP SETUP"));
   }
   oled.drawLine(0, 10, 127, 10, SH110X_WHITE);
 
@@ -337,39 +378,48 @@ void reconnectMQTT() {
 // ── Captive portal ───────────────────────────────────────────
 const char PORTAL_HTML[] PROGMEM = R"rawhtml(
 <!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Sinh Hoc</title>
+<title>AI Sinh Hoc WiFi</title>
 <style>
 body{font-family:system-ui,sans-serif;background:#071a12;color:#e8f5e9;display:flex;justify-content:center;padding:20px;margin:0}
-.c{max-width:400px;width:100%}h2{margin:0 0 6px;letter-spacing:.04em}
+.c{max-width:400px;width:100%}h2{margin:0 0 6px}
 .sub{opacity:.75;font-size:14px;margin-bottom:16px}
 input{width:100%;padding:12px;margin-bottom:10px;border-radius:10px;border:1px solid #1b4332;background:#0d2818;color:#fff;box-sizing:border-box}
 button{padding:12px;width:100%;background:#2d6a4f;color:#fff;border:none;border-radius:10px;font-weight:700}
 .scan{background:#40916c;margin-bottom:10px}
 .item{padding:10px;background:#0d2818;margin:6px 0;border-radius:10px;border:1px solid #1b4332}
-#st{margin-top:12px;font-size:14px}
+#st{margin-top:12px;font-size:14px;display:none;padding:10px;border-radius:8px;background:#14532d}
 </style></head><body><div class="c">
 <h2>AI SINH HOC</h2>
-<p class="sub">Cau hinh WiFi — DHT11 / ENS160 / OLED</p>
+<p class="sub">Cau hinh WiFi (chi mang 2.4GHz). Giữ BOOT 3s de mo lai portal.</p>
 <button class="scan" onclick="scan()">Quet mang WiFi</button>
 <div id="w"></div>
-<input id="s" placeholder="Ten WiFi">
-<input type="password" id="p" placeholder="Mat khau">
-<button onclick="conn()">Ket noi</button>
+<input id="s" placeholder="Ten WiFi" autocomplete="off">
+<input type="password" id="p" placeholder="Mat khau" autocomplete="off">
+<button onclick="conn()">Luu & Ket noi</button>
 <div id="st"></div>
 </div>
 <script>
-function scan(){document.getElementById('w').innerHTML='Dang quet...';
-fetch('/scan').then(r=>r.json()).then(l=>{
-document.getElementById('w').innerHTML=l.map(n=>
-`<div class="item" onclick="document.getElementById('s').value='${n.ssid.replace(/'/g,"\\'")}'">${n.ssid} (${n.rssi} dBm)</div>`
-).join('')}).catch(()=>document.getElementById('w').innerHTML='Loi quet')}
+function scan(){
+  document.getElementById('w').innerHTML='Dang quet...';
+  fetch('/scan').then(r=>r.json()).then(l=>{
+    document.getElementById('w').innerHTML=l.map(n=>
+      `<div class="item" onclick="document.getElementById('s').value=this.dataset.s" data-s="${n.ssid.replace(/"/g,'&quot;')}">${n.ssid} (${n.rssi} dBm)</div>`
+    ).join('');
+  }).catch(()=>document.getElementById('w').innerHTML='Loi quet mang');
+}
 function conn(){
-const s=document.getElementById('s').value,p=document.getElementById('p').value;
-if(!s)return alert('Nhap WiFi');
-const st=document.getElementById('st');st.textContent='Dang ket noi...';
-fetch('/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
-body:'ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p)})
-.then(r=>r.json()).then(d=>{st.textContent=d.ok?'OK — dang restart...':'Loi: '+(d.message||'that bai')})
+  const s=document.getElementById('s').value.trim();
+  const p=document.getElementById('p').value;
+  if(!s){alert('Nhap ten WiFi');return;}
+  const st=document.getElementById('st');
+  st.style.display='block';
+  st.textContent='Dang luu... may se restart va ket noi WiFi.';
+  // Form POST — captive portal dien thoai on dinh hon fetch
+  const f=document.createElement('form');
+  f.method='POST'; f.action='/connect';
+  const a=document.createElement('input'); a.name='ssid'; a.value=s; f.appendChild(a);
+  const b=document.createElement('input'); b.name='pass'; b.value=p; f.appendChild(b);
+  document.body.appendChild(f); f.submit();
 }
 </script></body></html>
 )rawhtml";
@@ -381,62 +431,99 @@ void handleNotFound() {
 void handleRoot() { webServer.send_P(200, "text/html", PORTAL_HTML); }
 
 void handleScan() {
-  int n = WiFi.scanNetworks();
+  // Bật tạm AP+STA để scan, rồi về AP thuần (tránh làm rớt portal)
+  WiFi.mode(WIFI_AP_STA);
+  delay(40);
+  int n = WiFi.scanNetworks(false, false, false, 120);
   String json = "[";
-  for (int i = 0; i < n; i++) {
-    if (i) json += ',';
-    String ssid = WiFi.SSID(i);
-    ssid.replace("\\", "\\\\");
-    ssid.replace("\"", "\\\"");
-    json += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
+  if (n > 0) {
+    for (int i = 0; i < n; i++) {
+      if (i) json += ',';
+      String ssid = WiFi.SSID(i);
+      ssid.replace("\\", "\\\\");
+      ssid.replace("\"", "\\\"");
+      json += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
+    }
+    WiFi.scanDelete();
   }
   json += "]";
-  WiFi.scanDelete();
+  WiFi.mode(WIFI_AP);
   webServer.send(200, "application/json", json);
 }
 
 void handleConnect() {
   String ssid = webServer.arg("ssid");
   String pass = webServer.arg("pass");
+  ssid.trim();
   if (!ssid.length()) {
-    webServer.send(200, "application/json", "{\"ok\":false,\"message\":\"empty\"}");
+    webServer.send(200, "text/html",
+      "<html><body style='background:#071a12;color:#fff;padding:24px;font-family:sans-serif'>"
+      "<h2>Loi</h2><p>Chua nhap ten WiFi.</p>"
+      "<a style='color:#52b788' href='/'>Quay lai</a></body></html>");
     return;
   }
-  ssid.toCharArray(pendingSsid, sizeof(pendingSsid));
-  pass.toCharArray(pendingPass, sizeof(pendingPass));
-  pendingStaConnect = true;
-  pendingStaAt = millis();
-  webServer.send(200, "application/json", "{\"ok\":true,\"message\":\"connecting\"}");
+  if (ssid.length() > 32) {
+    webServer.send(200, "text/html",
+      "<html><body style='background:#071a12;color:#fff;padding:24px;font-family:sans-serif'>"
+      "<h2>Loi</h2><p>Ten WiFi qua dai (toi da 32 ky tu).</p>"
+      "<a style='color:#52b788' href='/'>Quay lai</a></body></html>");
+    return;
+  }
+
+  // Lưu EEPROM trước → hiện trang OK trên AP → restart → STA thuần
+  addOrUpdateWifi(ssid, pass);
+  Serial.printf("[PORTAL] Da luu '%s' (pass len=%u) — restart\n",
+                ssid.c_str(), (unsigned)pass.length());
+
+  String html =
+    "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Da luu</title></head>"
+    "<body style='background:#071a12;color:#e8f5e9;font-family:sans-serif;padding:28px;text-align:center'>"
+    "<h2 style='color:#52b788'>Da luu WiFi!</h2>"
+    "<p>May dang <b>restart</b> de ket noi <b>";
+  html += ssid;
+  html +=
+    "</b>.</p>"
+    "<p style='color:#95d5b2'>Doi 15–20 giay. Mat mang AI_SinhHoc la binh thuong.</p>"
+    "<p>Neu that bai: noi lai <b>AI_SinhHoc</b>, kiem tra mat khau (dung <b>2.4GHz</b>).</p>"
+    "<p>Hoac giu nut <b>BOOT 3 giay</b> de mo lai portal.</p>"
+    "</body></html>";
+
+  webServer.send(200, "text/html", html);
+  webServer.client().flush();
+  delay(2000);  // đủ thời gian điện thoại tải trang
+  ESP.restart();
 }
 
 void startPortal() {
   portalActive = true;
-  WiFi.mode(WIFI_AP_STA);
+  pendingStaConnect = false;
+  Serial.println(F("\n[PORTAL] Khoi tao AP..."));
+
+  WiFi.persistent(false);
+  WiFi.disconnect(true, true);
+  delay(50);
+  WiFi.mode(WIFI_OFF);
+  delay(80);
+  WiFi.mode(WIFI_AP);
+  delay(50);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  // AP mở — nullptr ổn định hơn chuỗi rỗng trên ESP32
+  bool apOk = WiFi.softAP(AP_SSID, nullptr, 1, 0, 4);
+  Serial.printf("[PORTAL] softAP=%s SSID=%s IP=%s\n",
+                apOk ? "OK" : "FAIL", AP_SSID, WiFi.softAPIP().toString().c_str());
+
+  dnsServer.stop();
   dnsServer.start(DNS_PORT, "*", apIP);
+  webServer.stop();
   webServer.on("/", HTTP_GET, handleRoot);
   webServer.on("/scan", HTTP_GET, handleScan);
   webServer.on("/connect", HTTP_POST, handleConnect);
   webServer.onNotFound(handleNotFound);
   webServer.begin();
-  Serial.println(F("Portal AP: AI_SinhHoc → http://192.168.4.1"));
-}
 
-void processPendingSta() {
-  if (!pendingStaConnect) return;
-  if (millis() - pendingStaAt < 300) return;
-  pendingStaConnect = false;
-
-  WiFi.begin(pendingSsid, pendingPass);
-  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) delay(250);
-  if (WiFi.status() == WL_CONNECTED) {
-    addOrUpdateWifi(String(pendingSsid), String(pendingPass));
-    delay(500);
-    ESP.restart();
-  } else {
-    Serial.println(F("Portal connect fail"));
-  }
+  Serial.println(F("[PORTAL] Noi WiFi 'AI_SinhHoc' → http://192.168.4.1"));
 }
 
 // ── Double reset / BOOT hold ─────────────────────────────────
@@ -445,8 +532,9 @@ void checkDoubleReset() {
     isDoubleReset = true;
     rtcMagic = 0;
     wifiCount = 0;
+    memset(wifiList, 0, sizeof(wifiList));
     saveWifiList();
-    Serial.println(F("Double reset → xoa WiFi"));
+    Serial.println(F("DOUBLE RESET — xoa WiFi, mo Portal"));
   } else {
     isDoubleReset = false;
     rtcMagic = DOUBLE_RESET_MAGIC;
@@ -458,21 +546,29 @@ void clearDoubleResetFlag() {
 }
 
 void handleBootButton() {
+  // Chỉ dùng khi chưa vào portal — giữ BOOT 3s → xóa WiFi + mở AP
+  if (portalActive) return;
   bool pressed = digitalRead(PIN_BOOT_BTN) == LOW;
-  if (pressed && !bootWasPressed) {
-    bootWasPressed = true;
-    bootPressStart = millis();
-    bootHoldUiShown = false;
-  } else if (pressed && bootWasPressed) {
+  if (pressed) {
+    if (!bootWasPressed) {
+      bootWasPressed = true;
+      bootHoldUiShown = false;
+      bootPressStart = millis();
+      Serial.println(F("[BOOT] Giu 3s de xoa WiFi + mo Portal"));
+    }
     if (!bootHoldUiShown && millis() - bootPressStart >= BOOT_HOLD_MS) {
       bootHoldUiShown = true;
-      Serial.println(F("BOOT hold → portal"));
+      Serial.println(F("[BOOT] Xoa WiFi + mo Portal"));
       wifiCount = 0;
+      memset(wifiList, 0, sizeof(wifiList));
       saveWifiList();
+      WiFi.disconnect(true, true);
+      bootWasPressed = false;
       startPortal();
     }
   } else {
     bootWasPressed = false;
+    bootHoldUiShown = false;
   }
 }
 
@@ -540,7 +636,6 @@ void loop() {
   if (portalActive) {
     dnsServer.processNextRequest();
     webServer.handleClient();
-    processPendingSta();
     if (millis() - lastOled >= OLED_MS) {
       lastOled = millis();
       drawOled();
@@ -553,10 +648,13 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     if (now - lastReconnect >= RECONNECT_MS) {
       lastReconnect = now;
-      if (connectBestWifi()) wifiRetries = 0;
-      else if (++wifiRetries >= 3) {
-        startPortal();
+      if (connectBestWifi()) {
         wifiRetries = 0;
+      } else if (++wifiRetries >= 2) {
+        // Mất WiFi / sai mật khẩu → về portal sớm (không chờ lâu)
+        Serial.println(F("[WiFi] Mat mang — mo Portal de cau hinh lai"));
+        wifiRetries = 0;
+        startPortal();
       }
     }
     if (now - tRead >= READ_MS) {
