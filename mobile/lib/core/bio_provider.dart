@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -6,12 +7,20 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'config.dart';
 import 'mqtt_service.dart';
 
+class SensorPoint {
+  const SensorPoint(this.at, this.value);
+  final DateTime at;
+  final double value;
+}
+
 class BioProvider extends ChangeNotifier {
   BioProvider() {
     _mqtt = MqttService();
     _sub = _mqtt.messages.listen(_onMessage);
     _restore();
   }
+
+  static const int historyMax = 60;
 
   late final MqttService _mqtt;
   StreamSubscription<Map<String, dynamic>>? _sub;
@@ -25,6 +34,10 @@ class BioProvider extends ChangeNotifier {
   bool connecting = false;
   String status = 'Chưa kết nối';
   String? error;
+
+  final ListQueue<SensorPoint> tempHistory = ListQueue();
+  final ListQueue<SensorPoint> humiHistory = ListQueue();
+  final ListQueue<SensorPoint> co2History = ListQueue();
 
   bool get hasTelemetry => temp != null || humi != null || co2 != null;
 
@@ -56,6 +69,9 @@ class BioProvider extends ChangeNotifier {
     co2 = null;
     deviceOnline = false;
     lastUpdate = null;
+    tempHistory.clear();
+    humiHistory.clear();
+    co2History.clear();
     notifyListeners();
     await connect(force: true);
   }
@@ -80,6 +96,13 @@ class BioProvider extends ChangeNotifier {
 
   Future<void> reconnect() => connect(force: true);
 
+  void _pushHistory(ListQueue<SensorPoint> q, double value) {
+    q.addLast(SensorPoint(DateTime.now(), value));
+    while (q.length > historyMax) {
+      q.removeFirst();
+    }
+  }
+
   void _onMessage(Map<String, dynamic> msg) {
     final topic = msg['topic'] as String? ?? '';
     final payload = (msg['payload'] as String? ?? '').trim();
@@ -95,10 +118,13 @@ class BioProvider extends ChangeNotifier {
 
     if (topic == AppConfig.topicTemp) {
       temp = value;
+      _pushHistory(tempHistory, value);
     } else if (topic == AppConfig.topicHumi) {
       humi = value;
+      _pushHistory(humiHistory, value);
     } else if (topic == AppConfig.topicCo2) {
       co2 = value;
+      _pushHistory(co2History, value);
     } else {
       return;
     }
@@ -108,7 +134,6 @@ class BioProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Đánh giá nhanh chất lượng không khí theo eCO2 (ppm)
   String get co2Label {
     final v = co2;
     if (v == null) return 'Chờ dữ liệu';

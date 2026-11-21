@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 
 import '../core/bio_provider.dart';
 import '../core/config.dart';
+import 'sensor_charts.dart';
 import 'theme.dart';
 
 class HomePage extends StatelessWidget {
@@ -121,7 +122,7 @@ class HomePage extends StatelessWidget {
                     // Temp + Humi
                     SliverToBoxAdapter(
                       child: Padding(
-                        padding: const EdgeInsets.fromLTRB(24, 18, 24, 40),
+                        padding: const EdgeInsets.fromLTRB(24, 18, 24, 8),
                         child: Row(
                           children: [
                             Expanded(
@@ -147,6 +148,17 @@ class HomePage extends StatelessWidget {
                             ),
                           ],
                         ),
+                      ),
+                    ),
+
+                    // Charts
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(24, 20, 24, 40),
+                        child: SensorChartsSection(bio: bio)
+                            .animate()
+                            .fadeIn(delay: 200.ms)
+                            .slideY(begin: 0.04),
                       ),
                     ),
                   ],

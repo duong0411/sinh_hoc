@@ -4,11 +4,13 @@
  * ║   MQTT AloT (mqtt.duynguyen.io.vn WSS) + WiFi Portal        ║
  * ╚══════════════════════════════════════════════════════════════╝
  *
- * PINOUT:
- *   OLED 1.3" (SH1106)  SCL/SDA → GPIO 22 / GPIO 21   (Wire  I2C0)
- *   ENS160+AHT21        SCL/SDA → GPIO 26 / GPIO 25   (Wire1 I2C1)
- *   DHT11               DATA    → GPIO 27
- *   Nguồn chung         3V3 / GND
+ * PINOUT OLED (module 4 chân, thứ tự in trên PCB):
+ *   GND → GND ESP32
+ *   VCC → 3V3 (không cấp 5V nếu module ghi 3.3V)
+ *   SCL → GPIO 22
+ *   SDA → GPIO 21
+ *   ENS160+AHT21 SCL/SDA → GPIO 26 / GPIO 25 (Wire1)
+ *   DHT11 DATA → GPIO 27
  *
  * MQTT (chipId = 800):
  *   tele/800/status           online|offline
@@ -17,10 +19,9 @@
  *   tele/800_co2/status       {"value":450}
  *
  * THƯ VIỆN:
- *   WebSockets (Markus Sattler), MQTTPubSubClient (Hideaki Tai)
- *   DHT sensor library + Adafruit Unified Sensor
- *   SparkFun Indoor Air Quality Sensor - ENS160
- *   Adafruit SH110X, Adafruit GFX, Adafruit AHTX0
+ *   WebSockets, MQTTPubSubClient, DHT, SparkFun ENS160
+ *   Adafruit SH110X + Adafruit SSD1306 + GFX + AHTX0
+ *   (firmware tự thử SH1106 rồi SSD1306, địa chỉ 0x3C/0x3D)
  */
 
 #include <WiFi.h>
@@ -32,6 +33,7 @@
 #include <MQTTPubSubClient.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
+#include <Adafruit_SSD1306.h>
 #include <SparkFun_ENS160.h>
 #include <Adafruit_AHTX0.h>
 #include <DHT.h>
@@ -48,6 +50,7 @@
 #define OLED_W        128
 #define OLED_H        64
 #define OLED_ADDR     0x3C
+#define OLED_ADDR2    0x3D
 
 // ── WiFi portal ──────────────────────────────────────────────
 #define AP_SSID       "AI_SinhHoc"
@@ -79,7 +82,11 @@ struct WifiEntry {
 WifiEntry wifiList[MAX_WIFI];
 int wifiCount = 0;
 
-Adafruit_SH1106G oled(OLED_W, OLED_H, &Wire, -1);
+Adafruit_SH1106G oledSh(OLED_W, OLED_H, &Wire, -1);
+Adafruit_SSD1306 oledSd(OLED_W, OLED_H, &Wire, -1);
+enum OledDriver : uint8_t { OLED_NONE = 0, OLED_SH1106 = 1, OLED_SSD1306 = 2 };
+OledDriver oledDriver = OLED_NONE;
+
 SparkFun_ENS160 ens160;
 Adafruit_AHTX0 aht;
 DHT dht(PIN_DHT, DHT11);
@@ -95,6 +102,73 @@ uint16_t bioCo2 = 0;
 bool ensOk = false;
 bool ahtOk = false;
 bool oledOk = false;
+
+Adafruit_GFX* oledGfx() {
+  if (oledDriver == OLED_SH1106) return &oledSh;
+  if (oledDriver == OLED_SSD1306) return &oledSd;
+  return nullptr;
+}
+
+void oledShow() {
+  if (oledDriver == OLED_SH1106) oledSh.display();
+  else if (oledDriver == OLED_SSD1306) oledSd.display();
+}
+
+void oledClear() {
+  if (oledDriver == OLED_SH1106) oledSh.clearDisplay();
+  else if (oledDriver == OLED_SSD1306) oledSd.clearDisplay();
+}
+
+void scanI2cBus(TwoWire& bus, const char* tag) {
+  Serial.printf("[I2C scan %s] ", tag);
+  int found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    bus.beginTransmission(addr);
+    if (bus.endTransmission() == 0) {
+      Serial.printf("0x%02X ", addr);
+      found++;
+    }
+  }
+  if (!found) Serial.print(F("KHONG THAY THIET BI"));
+  Serial.println();
+}
+
+bool initOled() {
+  Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
+  Wire.setClock(100000);  // chậm hơn — ổn với dây dài / hàn xấu
+  delay(80);
+  scanI2cBus(Wire, "OLED");
+
+  // Ưu tiên SSD1306: nhiều module PCB xanh 4 chân (0.96"/1.3") là SSD1306
+  // dù begin(SH1106) vẫn ACK nhưng màn có thể đen.
+  oledDriver = OLED_NONE;
+  if (oledSd.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    oledDriver = OLED_SSD1306;
+    Serial.println(F("OLED: SSD1306 @0x3C"));
+  } else if (oledSd.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR2)) {
+    oledDriver = OLED_SSD1306;
+    Serial.println(F("OLED: SSD1306 @0x3D"));
+  } else if (oledSh.begin(OLED_ADDR, true)) {
+    oledDriver = OLED_SH1106;
+    Serial.println(F("OLED: SH1106 @0x3C"));
+  } else if (oledSh.begin(OLED_ADDR2, true)) {
+    oledDriver = OLED_SH1106;
+    Serial.println(F("OLED: SH1106 @0x3D"));
+  } else {
+    Serial.println(F("OLED FAIL — kiem tra day GND/VCC/SCL=22/SDA=21 + han chạm VCC-SCL"));
+    return false;
+  }
+
+  // Nháy trắng ngắn để xác nhận panel sống
+  Adafruit_GFX* g = oledGfx();
+  oledClear();
+  g->fillScreen(SSD1306_WHITE);
+  oledShow();
+  delay(200);
+  oledClear();
+  oledShow();
+  return true;
+}
 
 bool portalActive = false;
 bool pendingStaConnect = false;  // giữ tương thích (không dùng — connect = lưu + restart)
@@ -274,57 +348,72 @@ void readSensors() {
                 bioTemp, bioHum, (unsigned)bioCo2);
 }
 
-// ── OLED ─────────────────────────────────────────────────────
+// ── OLED UI (128x64) — bảng đo sạch ──────────────────────────
+static void oledPrintCentered(Adafruit_GFX* g, int16_t y, uint8_t size, const char* s) {
+  g->setTextSize(size);
+  int16_t x1, y1;
+  uint16_t w, h;
+  g->getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
+  g->setCursor((OLED_W - (int16_t)w) / 2, y);
+  g->print(s);
+}
+
+static void oledPrintCenteredIn(Adafruit_GFX* g, int16_t x0, int16_t boxW, int16_t y,
+                                uint8_t size, const char* s) {
+  g->setTextSize(size);
+  int16_t x1, y1;
+  uint16_t w, h;
+  g->getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
+  g->setCursor(x0 + (boxW - (int16_t)w) / 2, y);
+  g->print(s);
+}
+
 void drawOled() {
   if (!oledOk) return;
-  oled.clearDisplay();
-  oled.setTextColor(SH110X_WHITE);
+  Adafruit_GFX* g = oledGfx();
+  if (!g) return;
 
-  oled.setTextSize(1);
-  oled.setCursor(0, 0);
-  oled.print(F("AI SINH HOC"));
-  if (WiFi.status() == WL_CONNECTED) {
-    oled.setCursor(90, 0);
-    oled.print(mqttClient.isConnected() ? F("MQTT") : F("WiFi"));
-  } else if (portalActive) {
-    oled.setCursor(64, 0);
-    oled.print(F("AP SETUP"));
-  }
-  oled.drawLine(0, 10, 127, 10, SH110X_WHITE);
+  oledClear();
+  g->setTextColor(SSD1306_WHITE);
 
-  // Nhiệt độ
-  oled.setCursor(0, 16);
-  oled.print(F("Nhiet do"));
-  oled.setTextSize(2);
-  oled.setCursor(0, 26);
-  if (isnan(bioTemp)) oled.print(F("--.-"));
-  else oled.printf("%.1f", bioTemp);
-  oled.setTextSize(1);
-  oled.print(F(" C"));
+  char tBuf[16], hBuf[16], cBuf[12];
+  if (isnan(bioTemp)) snprintf(tBuf, sizeof(tBuf), "--.-");
+  else snprintf(tBuf, sizeof(tBuf), "%.1f", bioTemp);
+  if (isnan(bioHum)) snprintf(hBuf, sizeof(hBuf), "--");
+  else snprintf(hBuf, sizeof(hBuf), "%.0f", bioHum);
+  if (bioCo2 == 0) snprintf(cBuf, sizeof(cBuf), "----");
+  else snprintf(cBuf, sizeof(cBuf), "%u", (unsigned)bioCo2);
 
-  // Độ ẩm
-  oled.setTextSize(1);
-  oled.setCursor(72, 16);
-  oled.print(F("Do am"));
-  oled.setTextSize(2);
-  oled.setCursor(72, 26);
-  if (isnan(bioHum)) oled.print(F("--"));
-  else oled.printf("%.0f", bioHum);
-  oled.setTextSize(1);
-  oled.print(F("%"));
+  // ══ HERO: CO2 ══════════════════════════════════════════════
+  oledPrintCentered(g, 0, 1, "CO2");
+  // Số lớn — size 3 nếu <= 3 chữ số, size 2 nếu nhiều hơn
+  uint8_t cSize = (strlen(cBuf) <= 3) ? 3 : 2;
+  int16_t cY = (cSize == 3) ? 10 : 12;
+  oledPrintCentered(g, cY, cSize, cBuf);
+  oledPrintCentered(g, (cSize == 3) ? 36 : 30, 1, "ppm");
 
-  // CO2 full width
-  oled.drawLine(0, 46, 127, 46, SH110X_WHITE);
-  oled.setCursor(0, 50);
-  oled.print(F("CO2 "));
-  oled.setTextSize(2);
-  oled.setCursor(28, 48);
-  if (bioCo2 == 0) oled.print(F("----"));
-  else oled.printf("%u", (unsigned)bioCo2);
-  oled.setTextSize(1);
-  oled.print(F(" ppm"));
+  // Đường phân cách mềm (không full-bleed sát mép)
+  g->drawFastHLine(10, 44, 108, SSD1306_WHITE);
 
-  oled.display();
+  // ══ TEMP | HUM ═════════════════════════════════════════════
+  // Cột trái
+  oledPrintCenteredIn(g, 0, 63, 48, 1, "TEMP");
+  char tLine[16];
+  snprintf(tLine, sizeof(tLine), "%sC", tBuf);
+  oledPrintCenteredIn(g, 0, 63, 56, 1, tLine);
+
+  // Cột phải
+  oledPrintCenteredIn(g, 65, 63, 48, 1, "HUM");
+  char hLine[16];
+  snprintf(hLine, sizeof(hLine), "%s%%", hBuf);
+  oledPrintCenteredIn(g, 65, 63, 56, 1, hLine);
+
+  // Vạch dọc nhẹ giữa 2 cột dưới
+  g->drawFastVLine(64, 47, 15, SSD1306_WHITE);
+
+  if (portalActive) g->fillCircle(123, 3, 2, SSD1306_WHITE);
+
+  oledShow();
 }
 
 // ── MQTT ─────────────────────────────────────────────────────
@@ -612,25 +701,13 @@ void setup() {
 
   pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
 
-  // OLED — Wire (I2C0)
-  Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
-  Wire.setClock(400000);
-  oledOk = oled.begin(OLED_ADDR, true);
-  if (oledOk) {
-    oled.clearDisplay();
-    oled.setTextSize(1);
-    oled.setTextColor(SH110X_WHITE);
-    oled.setCursor(8, 28);
-    oled.print(F("AI Sinh Hoc..."));
-    oled.display();
-    Serial.println(F("OLED OK"));
-  } else {
-    Serial.println(F("OLED FAIL — thu dia chi 0x3D neu can"));
-  }
+  // OLED — Wire (I2C0): GPIO21=SDA, GPIO22=SCL
+  oledOk = initOled();
 
   // ENS160 + AHT21 — Wire1 (I2C1)
   Wire1.begin(PIN_SENS_SDA, PIN_SENS_SCL);
   Wire1.setClock(100000);
+  scanI2cBus(Wire1, "SENS");
   ensOk = ens160.begin(Wire1, ENS160_ADDRESS_HIGH);
   if (!ensOk) ensOk = ens160.begin(Wire1, ENS160_ADDRESS_LOW);
   if (ensOk) {
