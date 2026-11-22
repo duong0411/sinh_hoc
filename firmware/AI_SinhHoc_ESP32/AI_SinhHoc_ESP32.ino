@@ -626,12 +626,14 @@ void pubOnline() { mqttPub(CHIP_ID, "online", true); }
 
 void pubTemp() {
   if (isnan(bioTemp)) return;
+  // 1 chữ số thập phân — khớp OLED "%.1f"
   mqttPub(DEV_TEMP, "{\"value\":" + String(bioTemp, 1) + "}", true);
 }
 
 void pubHumi() {
   if (isnan(bioHum)) return;
-  mqttPub(DEV_HUMI, "{\"value\":" + String(bioHum, 1) + "}", true);
+  // Làm tròn 0 chữ số — khớp OLED "%.0f" (tránh app 46.4 / OLED 46)
+  mqttPub(DEV_HUMI, "{\"value\":" + String((int)(bioHum + 0.5f)) + "}", true);
 }
 
 void pubCo2() {
@@ -639,13 +641,20 @@ void pubCo2() {
   mqttPub(DEV_CO2, "{\"value\":" + String(bioCo2) + "}", true);
 }
 
+static void mqttFlush() {
+  // Đẩy frame WSS ngay — giảm app nhận trễ 1 vòng so với OLED
+  mqttClient.update();
+  wsClient.loop();
+}
+
 void pubAll() {
-  // Giãn nhẹ giữa 3 pub — tránh burst WSS drop (app lệch / mất connect)
-  pubTemp();
-  delay(30);
-  pubHumi();
-  delay(30);
+  // CO2 trước (hero), rồi temp/humi — app khớp OLED nhanh hơn
   pubCo2();
+  mqttFlush();
+  pubTemp();
+  mqttFlush();
+  pubHumi();
+  mqttFlush();
 }
 
 bool mqttStarted = false;
@@ -1107,14 +1116,17 @@ void loop() {
     reconnectMQTT();
   }
 
-  // Cùng vòng đọc → OLED + MQTT cùng số
+  // Cùng vòng đọc → OLED + MQTT cùng một bộ số (draw ngay sau đọc)
   if (now - tRead >= READ_MS) {
     tRead = now;
     readSensors();
+    drawOled();
+    lastOled = now;
     if (mqttClient.isConnected()) {
       pubAll();
       lastTelemetry = now;
-      Serial.printf("[MQTT] sync OLED CO2=%u\n", (unsigned)bioCo2);
+      Serial.printf("[MQTT] sync OLED T=%.1f H=%.0f CO2=%u\n",
+                    bioTemp, bioHum, (unsigned)bioCo2);
     }
   }
 

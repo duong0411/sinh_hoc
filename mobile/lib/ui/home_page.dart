@@ -1,5 +1,3 @@
-import 'dart:ui';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:provider/provider.dart';
@@ -159,39 +157,59 @@ class HomePage extends StatelessWidget {
   }
 }
 
-/// Số cảm biến: cùng font, tabular figures → "550" / "1200" không nhảy to–bé.
+/// Số cảm biến — mỗi ký tự ô rộng cố định → "1"/"0"/"5" cùng cỡ
+/// (CO₂, nhiệt độ, độ ẩm đều dùng chung).
 class _SensorNumber extends StatelessWidget {
   const _SensorNumber({
     required this.text,
     required this.fontSize,
     this.color = BioTheme.cream,
-    this.maxLines = 1,
   });
 
   final String text;
   final double fontSize;
   final Color color;
-  final int maxLines;
 
   @override
   Widget build(BuildContext context) {
-    return Text(
-      text,
-      maxLines: maxLines,
-      overflow: TextOverflow.visible,
-      softWrap: false,
-      style: TextStyle(
-        fontFamily: 'Georgia',
-        fontSize: fontSize,
-        height: 1.0,
-        fontWeight: FontWeight.w700,
-        letterSpacing: 0.5,
-        color: color,
-        fontFeatures: const [
-          FontFeature.tabularFigures(),
-          FontFeature.liningFigures(),
-        ],
-      ),
+    // Ô rộng ~0.62em: số monospace thực sự, không phụ thuộc tabular của Georgia
+    final cellW = fontSize * 0.62;
+    final style = TextStyle(
+      fontFamily: 'Segoe UI',
+      fontFamilyFallback: const ['Roboto', 'Arial'],
+      fontSize: fontSize,
+      height: 1.0,
+      fontWeight: FontWeight.w700,
+      color: color,
+      fontFeatures: const [
+        FontFeature.tabularFigures(),
+        FontFeature.liningFigures(),
+      ],
+    );
+
+    final cells = <Widget>[];
+    for (var i = 0; i < text.length; i++) {
+      final ch = text[i];
+      cells.add(
+        SizedBox(
+          width: (ch == '.' || ch == ',') ? cellW * 0.45 : cellW,
+          height: fontSize * 1.05,
+          child: Center(
+            child: Text(
+              ch,
+              style: style,
+              textAlign: TextAlign.center,
+              maxLines: 1,
+              softWrap: false,
+            ),
+          ),
+        ),
+      );
+    }
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: cells,
     );
   }
 }
@@ -389,7 +407,7 @@ class _MetricTile extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           SizedBox(
-            height: 48,
+            height: 56,
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
@@ -399,18 +417,18 @@ class _MetricTile extends StatelessWidget {
                     alignment: Alignment.bottomLeft,
                     child: _SensorNumber(
                       text: value,
-                      fontSize: 44,
+                      fontSize: 52,
                       color: BioTheme.cream,
                     ),
                   ),
                 ),
                 const SizedBox(width: 6),
                 Padding(
-                  padding: const EdgeInsets.only(bottom: 6),
+                  padding: const EdgeInsets.only(bottom: 8),
                   child: Text(
                     unit,
                     style: TextStyle(
-                      fontSize: 16,
+                      fontSize: 18,
                       fontWeight: FontWeight.w600,
                       color: BioTheme.soft.withValues(alpha: 0.85),
                     ),

@@ -1,5 +1,3 @@
-import 'dart:ui';
-
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 
@@ -191,19 +189,10 @@ class _ChartCard extends StatelessWidget {
                 ),
               ),
               const Spacer(),
-              Text(
-                display == null ? '-- $unit' : '${_fmt(display)} $unit',
-                style: TextStyle(
-                  fontFamily: 'Georgia',
-                  fontSize: 18,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 0.4,
-                  color: color,
-                  fontFeatures: const [
-                    FontFeature.tabularFigures(),
-                    FontFeature.liningFigures(),
-                  ],
-                ),
+              _ChartValue(
+                text: display == null ? '--' : _fmt(display),
+                unit: unit,
+                color: color,
               ),
             ],
           ),
@@ -362,5 +351,58 @@ class _ChartCard extends StatelessWidget {
     if (v.abs() >= 100) return v.toStringAsFixed(0);
     if (v == v.roundToDouble()) return v.toStringAsFixed(0);
     return v.toStringAsFixed(1);
+  }
+}
+
+/// Số góc phải biểu đồ — ô chữ số cố định (cùng cách CO₂ / nhiệt / ẩm)
+class _ChartValue extends StatelessWidget {
+  const _ChartValue({
+    required this.text,
+    required this.unit,
+    required this.color,
+  });
+
+  final String text;
+  final String unit;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    const fontSize = 20.0;
+    final cellW = fontSize * 0.62;
+    final style = TextStyle(
+      fontFamily: 'Segoe UI',
+      fontFamilyFallback: const ['Roboto', 'Arial'],
+      fontSize: fontSize,
+      height: 1.0,
+      fontWeight: FontWeight.w700,
+      color: color,
+    );
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        for (var i = 0; i < text.length; i++)
+          SizedBox(
+            width: (text[i] == '.' || text[i] == ',') ? cellW * 0.45 : cellW,
+            height: fontSize * 1.05,
+            child: Center(
+              child: Text(text[i], style: style, textAlign: TextAlign.center),
+            ),
+          ),
+        const SizedBox(width: 4),
+        Padding(
+          padding: const EdgeInsets.only(bottom: 1),
+          child: Text(
+            unit,
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: color.withValues(alpha: 0.9),
+            ),
+          ),
+        ),
+      ],
+    );
   }
 }
