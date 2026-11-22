@@ -73,6 +73,11 @@ const byte DNS_PORT = 53;
 #define RECONNECT_MS  10000
 #define OLED_MS       1000
 
+// Cờ bàn giao: lần đầu chạy bản firmware này → xóa WiFi xưởng 1 lần rồi thôi
+// (đổi 0x5C → 0x5D nếu sau này cần clear lại khi ship đợt mới)
+#define SHIP_FLAG_ADDR  508
+#define SHIP_FLAG_DONE  0x5C
+
 // Lọc nhiễu eCO2 ENS160: median-of-5 + EMA + giới hạn nhảy đột biến
 #define CO2_MEDIAN_N     5
 #define CO2_EMA_ALPHA    0.28f   // 0..1 — càng nhỏ càng mượt
@@ -308,7 +313,8 @@ static bool tryWifiCreds(const char* ssid, const char* pass, int attempts = 24) 
   WiFi.disconnect(true, true);
   delay(150);
   Serial.printf("[WiFi] STA begin '%s'\n", ssid);
-  WiFi.begin(ssid, pass);
+  // pass rỗng = WiFi mở (không mật khẩu) — vẫn hợp lệ
+  WiFi.begin(ssid, (pass && pass[0]) ? pass : nullptr);
   for (int i = 0; i < attempts && WiFi.status() != WL_CONNECTED; i++) {
     delay(500);
     Serial.print('.');
@@ -321,8 +327,27 @@ static bool tryWifiCreds(const char* ssid, const char* pass, int attempts = 24) 
   return false;
 }
 
-// Quét → chỉ nối SSID đã lưu ĐANG THẤY.
-// Ship sang nhà khách: không thấy WiFi cũ → false + outNoSavedVisible=true → mở portal ngay.
+// Xóa WiFi xưởng đúng 1 lần khi bàn giao (lần boot đầu sau nạp bản này).
+// Lần sau giữ nguyên WiFi khách đã lưu — không xóa lại.
+static void clearFactoryWifiOnceForShip() {
+  EEPROM.begin(EEPROM_SIZE);
+  uint8_t flag = EEPROM.read(SHIP_FLAG_ADDR);
+  EEPROM.end();
+  if (flag == SHIP_FLAG_DONE) return;
+
+  Serial.println(F("[SHIP] Clear WiFi xuong 1 lan — san sang giao khach"));
+  wifiCount = 0;
+  memset(wifiList, 0, sizeof(wifiList));
+  saveWifiList();
+
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.write(SHIP_FLAG_ADDR, SHIP_FLAG_DONE);
+  EEPROM.commit();
+  EEPROM.end();
+}
+
+// Quét → ưu tiên SSID đã lưu đang thấy; nếu không thấy vẫn thử STA
+// (SSID ẩn / scan sót). Chỉ báo "đổi chỗ" khi đã thử hết và không thấy trên scan.
 bool connectBestWifi(bool* outNoSavedVisible) {
   if (outNoSavedVisible) *outNoSavedVisible = false;
   Serial.println(F("\n[WiFi] Quet mang..."));
@@ -338,14 +363,25 @@ bool connectBestWifi(bool* outNoSavedVisible) {
 
   int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false);
   if (n < 0) {
-    Serial.println(F("[WiFi] scan loi — thu lai sau"));
+    // Lỗi scan tạm — KHÔNG xóa WiFi / mở portal
+    Serial.println(F("[WiFi] scan loi — thu lai sau (giu WiFi da luu)"));
+    return false;
+  }
+  if (n == 0) {
+    // Scan trống tạm thời — KHÔNG coi là đổi chỗ (tránh xóa WiFi khách)
+    Serial.println(F("[WiFi] scan rong — thu lai sau (giu WiFi da luu)"));
+    WiFi.scanDelete();
     return false;
   }
 
-  // Chỉ các SSID đã lưu và đang xuất hiện (tránh mù thử WiFi chỗ cũ khi đã chuyển chỗ)
+  bool tried[MAX_WIFI];
+  for (int i = 0; i < MAX_WIFI; i++) tried[i] = false;
+
   int order[MAX_WIFI];
   int orderCount = 0;
   int rssiOf[MAX_WIFI];
+  int savedVisible = 0;
+
   for (int w = 0; w < wifiCount; w++) {
     if (!wifiSsidOk(wifiList[w].ssid)) continue;
     int best = -999;
@@ -357,20 +393,15 @@ bool connectBestWifi(bool* outNoSavedVisible) {
       }
     }
     if (!seen) continue;
+    savedVisible++;
     order[orderCount] = w;
     rssiOf[orderCount] = best;
     orderCount++;
   }
   WiFi.scanDelete();
-  Serial.printf("[WiFi] scan=%d savedVisible=%d/%d\n", n, orderCount, wifiCount);
+  Serial.printf("[WiFi] scan=%d savedVisible=%d/%d\n", n, savedVisible, wifiCount);
 
-  if (orderCount == 0) {
-    Serial.println(F("[WiFi] Khong thay SSID da luu — mang moi / chuyen cho → portal"));
-    if (outNoSavedVisible) *outNoSavedVisible = true;
-    return false;
-  }
-
-  // Sắp xếp RSSI cao → thấp (insertion sort nhỏ)
+  // Sắp xếp RSSI cao → thấp
   for (int i = 1; i < orderCount; i++) {
     int ow = order[i], orr = rssiOf[i], j = i;
     while (j > 0 && rssiOf[j - 1] < orr) {
@@ -382,9 +413,27 @@ bool connectBestWifi(bool* outNoSavedVisible) {
     rssiOf[j] = orr;
   }
 
+  // 1) Thử các mạng đang thấy (ưu tiên sóng mạnh)
   for (int i = 0; i < orderCount; i++) {
     int w = order[i];
+    tried[w] = true;
     if (tryWifiCreds(wifiList[w].ssid, wifiList[w].pass)) return true;
+  }
+
+  // 2) Thử mạng đã lưu nhưng scan không thấy (SSID ẩn / sót quét)
+  for (int w = 0; w < wifiCount; w++) {
+    if (tried[w] || !wifiSsidOk(wifiList[w].ssid)) continue;
+    Serial.printf("[WiFi] Thu SSID an/khong thay: '%s'\n", wifiList[w].ssid);
+    if (tryWifiCreds(wifiList[w].ssid, wifiList[w].pass, 16)) return true;
+  }
+
+  // Không kết nối được. Chỉ mở portal+xóa khi thật sự không thấy SSID đã lưu trên scan
+  // (tránh xóa WiFi khách vì mất sóng tạm / sai mật khẩu nhưng SSID vẫn còn).
+  if (savedVisible == 0) {
+    Serial.println(F("[WiFi] Khong thay SSID da luu — mang moi / chuyen cho → portal"));
+    if (outNoSavedVisible) *outNoSavedVisible = true;
+  } else {
+    Serial.println(F("[WiFi] Thay SSID nhung sai pass/yeu — giu list, mo portal nhap lai"));
   }
   return false;
 }
@@ -591,18 +640,26 @@ void pubCo2() {
 }
 
 void pubAll() {
+  // Giãn nhẹ giữa 3 pub — tránh burst WSS drop (app lệch / mất connect)
   pubTemp();
+  delay(30);
   pubHumi();
+  delay(30);
   pubCo2();
 }
 
 bool mqttStarted = false;
 bool mqttNeedConnect = false;
+int wifiDownStreak = 0;          // WiFi chập chờn: chờ vài chu kỳ mới stop MQTT
+unsigned long lastWssOpenMs = 0; // tránh beginSSL liên tục
 
 static void openWss() {
+  // Không spam beginSSL nếu vừa mở < 3s
+  if (millis() - lastWssOpenMs < 3000 && wsClient.isConnected()) return;
   wsClient.setExtraHeaders("Sec-WebSocket-Protocol: mqtt");
   wsClient.setReconnectInterval(2000);
   wsClient.beginSSL(MQTT_HOST, MQTT_PORT, MQTT_PATH);
+  lastWssOpenMs = millis();
   Serial.printf("[WSS] beginSSL %s:%d%s\n", MQTT_HOST, MQTT_PORT, MQTT_PATH);
   wssReady = false;
 }
@@ -613,8 +670,8 @@ void startMqttStack() {
   openWss();
   mqttClient.begin(wsClient);
   mqttClient.setTimeout(15000);
-  mqttClient.setKeepAliveTimeout(20);
-  mqttClient.setKeepAliveSendInterval(8000);
+  mqttClient.setKeepAliveTimeout(30);      // khớp app keepalive ~40s
+  mqttClient.setKeepAliveSendInterval(12000);
   mqttStarted = true;
   mqttNeedConnect = true;
   mqttLoggedOk = false;
@@ -662,10 +719,12 @@ void reconnectMQTT() {
     mqttLoggedOk = false;
     mqttNeedConnect = true;
     wssReady = false;
-    // connect() fail gọi close() → phải beginSSL lại
+    // Chỉ beginSSL lại nếu socket đã chết (tránh cắt WSS đang sống)
     delay(100);
-    openWss();
-    mqttClient.begin(wsClient);
+    if (!wsClient.isConnected()) {
+      openWss();
+      mqttClient.begin(wsClient);
+    }
     return;
   }
 
@@ -836,8 +895,11 @@ void handleConnect() {
   WiFi.disconnect(false, false);
   delay(100);
   ensureSoftAP();
-  WiFi.begin(ssid.c_str(), pass.c_str());
-  for (int i = 0; i < 36 && WiFi.status() != WL_CONNECTED; i++) {
+  // WiFi mở (không mật khẩu): begin với nullptr
+  if (pass.length() == 0) WiFi.begin(ssid.c_str(), nullptr);
+  else WiFi.begin(ssid.c_str(), pass.c_str());
+  // ~25s — router khách chậm / đông thiết bị vẫn kịp
+  for (int i = 0; i < 50 && WiFi.status() != WL_CONNECTED; i++) {
     delay(150);
     dnsServer.processNextRequest();
     webServer.handleClient();
@@ -930,8 +992,10 @@ void setup() {
   drawOled();
 
   loadWifiList();
+  // Bàn giao khách: xóa WiFi xưởng đúng 1 lần → boot sau mở portal sạch
+  clearFactoryWifiOnceForShip();
 
-  // Đặt 1 chỉ khi test portal tại xưởng; bàn giao phải = 0 (giữ WiFi đã lưu trong EEPROM)
+  // Đặt 1 chỉ khi test portal tại xưởng; bàn giao phải = 0
 #ifndef FORCE_PORTAL_TEST
 #define FORCE_PORTAL_TEST 0
 #endif
@@ -985,17 +1049,25 @@ void loop() {
 
   // Mất WiFi → thử lại; không thấy SSID đã lưu (đổi chỗ) → portal ngay
   if (WiFi.status() != WL_CONNECTED) {
-    if (mqttStarted) stopMqttStack();
     if (now - lastReconnect >= RECONNECT_MS) {
       lastReconnect = now;
+      // Mỗi chu kỳ 10s +1; đủ 3 (~30s) mới stop MQTT — chịu chập chờn ngắn
+      wifiDownStreak++;
+      if (mqttStarted && wifiDownStreak >= 3) {
+        Serial.println(F("[WiFi] mat lau — stop MQTT stack"));
+        stopMqttStack();
+      }
       bool noSavedVisible = false;
       if (connectBestWifi(&noSavedVisible)) {
         wifiRetries = 0;
+        wifiDownStreak = 0;
         startMqttStack();
       } else if (noSavedVisible) {
         // Đổi chỗ / WiFi cũ biến mất → portal ngay (không cần tắt nguồn)
         Serial.println(F("[WiFi] Khong thay mang da luu — mo Portal cho khach"));
         wifiRetries = 0;
+        wifiDownStreak = 0;
+        if (mqttStarted) stopMqttStack();
         openPortalForNewWifi(/*clearOldSaved=*/true);
       } else {
         // SSID vẫn thấy (mất sóng tạm) — chỉ thử lại, không kẹt portal
@@ -1014,6 +1086,7 @@ void loop() {
     return;
   }
   wifiRetries = 0;
+  wifiDownStreak = 0;
 
   if (!mqttStarted) startMqttStack();
 

@@ -17,6 +17,7 @@ class BioProvider extends ChangeNotifier {
   BioProvider() {
     _mqtt = MqttService();
     _sub = _mqtt.messages.listen(_onMessage);
+    _connSub = _mqtt.connectionEvents.listen(_onConnEvent);
     _restore();
     _staleTimer = Timer.periodic(const Duration(seconds: 1), (_) => _checkStale());
   }
@@ -26,14 +27,18 @@ class BioProvider extends ChangeNotifier {
   static const Duration chartSampleEvery = Duration(seconds: 5);
   /// LIVE nếu còn nhận số trong cửa sổ này (ESP pub ~1.5s)
   static const Duration liveWindow = Duration(seconds: 18);
-  /// Chỉ reconnect khi im quá lâu — tránh cắt realtime mỗi ~20s
-  static const Duration forceReconnectAfter = Duration(seconds: 55);
+  /// Im telemetry lâu nhưng socket còn → chỉ resubscribe (không disconnect)
+  static const Duration resubAfterSilent = Duration(seconds: 25);
+  /// Chỉ full reconnect khi socket thật sự chết
+  static const Duration reconnectIfDownAfter = Duration(seconds: 8);
 
   late final MqttService _mqtt;
   StreamSubscription<Map<String, dynamic>>? _sub;
+  StreamSubscription<MqttConnEvent>? _connSub;
   Timer? _staleTimer;
   bool _reconnectLock = false;
-  DateTime? _lastReconnectAt;
+  DateTime? _lastResubAt;
+  DateTime? _lastDownReconnectAt;
 
   double? temp;
   double? humi;
@@ -72,7 +77,7 @@ class BioProvider extends ChangeNotifier {
     if (isLive) return 'Trực tiếp · chip ${AppConfig.chipId}';
     if (deviceOnline) return 'ESP online — đang chờ số đo mới';
     if (hasTelemetry) {
-      return 'ESP32 offline — đang hiện dữ liệu cũ (retain)';
+      return 'MQTT OK — đang chờ số đo mới từ ESP';
     }
     return 'MQTT OK — chờ ESP32 (chip ${AppConfig.chipId})';
   }
@@ -80,7 +85,7 @@ class BioProvider extends ChangeNotifier {
   String get lastUpdateLabel {
     if (lastUpdate == null) return '';
     final s = DateTime.now().difference(lastUpdate!).inSeconds;
-    // ESP pub ~1.5s — coi ≤4s là “vừa cập nhật” để UI không nhảy “2s…3s…”
+    // ESP pub ~1.5s — coi ≤4s là “vừa cập nhật”
     if (s <= 4) return 'Vừa cập nhật';
     if (s < 60) return 'Cập nhật $s giây trước';
     final m = s ~/ 60;
@@ -93,6 +98,25 @@ class BioProvider extends ChangeNotifier {
     final m = t.minute.toString().padLeft(2, '0');
     final s = t.second.toString().padLeft(2, '0');
     return '$h:$m:$s';
+  }
+
+  void _onConnEvent(MqttConnEvent e) {
+    switch (e) {
+      case MqttConnEvent.connected:
+      case MqttConnEvent.autoReconnected:
+        mqttConnected = true;
+        connecting = false;
+        error = null;
+        status = 'Đã kết nối';
+        // Sau auto-reconnect: sub lại để nhận retain/live ngay
+        _mqtt.resubscribe();
+        break;
+      case MqttConnEvent.disconnected:
+        mqttConnected = false;
+        status = 'Mất kết nối MQTT';
+        break;
+    }
+    notifyListeners();
   }
 
   Future<void> _restore() async {
@@ -142,15 +166,12 @@ class BioProvider extends ChangeNotifier {
     mqttConnected = ok;
     connecting = false;
     _reconnectLock = false;
-    _lastReconnectAt = DateTime.now();
 
     if (!ok) {
       error = _mqtt.lastError.isEmpty ? 'Không kết nối được broker' : _mqtt.lastError;
       status = 'Lỗi MQTT';
     } else {
       status = 'Đã kết nối';
-      // Chỉ xóa freshness khi đổi chip / pull-to-refresh chủ động
-      // Soft reconnect giữ lastUpdate → UI không nhảy “10 giây trước”
       if (clearFreshness) lastUpdate = null;
     }
     notifyListeners();
@@ -159,25 +180,48 @@ class BioProvider extends ChangeNotifier {
   Future<void> reconnect() => connect(force: true, clearFreshness: true);
 
   void _checkStale() {
-    if (hasTelemetry || mqttConnected) {
+    // Cập nhật nhãn thời gian mỗi giây
+    if (hasTelemetry || mqttConnected || connecting) {
       notifyListeners();
     }
-    if (!mqttConnected || lastUpdate == null || _reconnectLock) return;
 
-    final silent = DateTime.now().difference(lastUpdate!);
-    if (silent <= forceReconnectAfter) return;
+    if (_reconnectLock) return;
 
-    // Tránh spam reconnect
-    if (_lastReconnectAt != null &&
-        DateTime.now().difference(_lastReconnectAt!) < const Duration(seconds: 15)) {
+    final down = !mqttConnected || !_mqtt.isConnected;
+    if (down) {
+      // Socket chết → để autoReconnect làm việc; chỉ force nếu vẫn down quá lâu
+      final now = DateTime.now();
+      if (_lastDownReconnectAt != null &&
+          now.difference(_lastDownReconnectAt!) < const Duration(seconds: 20)) {
+        return;
+      }
+      // Chờ một nhịp để autoReconnect kịp
+      if (_lastDownReconnectAt == null) {
+        _lastDownReconnectAt = now;
+        return;
+      }
+      if (now.difference(_lastDownReconnectAt!) < reconnectIfDownAfter) return;
+      _lastDownReconnectAt = now;
+      if (kDebugMode) print('BioProvider: socket down → force reconnect');
+      connect(force: true, clearFreshness: false);
       return;
     }
 
-    if (kDebugMode) {
-      print('BioProvider: silent ${silent.inSeconds}s → soft reconnect');
+    _lastDownReconnectAt = null;
+
+    // Socket sống nhưng im telemetry → chỉ resubscribe, KHÔNG disconnect
+    if (lastUpdate == null) return;
+    final silent = DateTime.now().difference(lastUpdate!);
+    if (silent < resubAfterSilent) return;
+    if (_lastResubAt != null &&
+        DateTime.now().difference(_lastResubAt!) < const Duration(seconds: 20)) {
+      return;
     }
-    // Soft: giữ số đo + lastUpdate; chỉ nối lại socket
-    connect(force: true, clearFreshness: false);
+    _lastResubAt = DateTime.now();
+    if (kDebugMode) {
+      print('BioProvider: silent ${silent.inSeconds}s → resubscribe only');
+    }
+    _mqtt.resubscribe();
   }
 
   void _pushHistorySparse(
@@ -188,7 +232,6 @@ class BioProvider extends ChangeNotifier {
   ) {
     final now = DateTime.now();
     if (lastAt != null && now.difference(lastAt) < chartSampleEvery) {
-      // Cập nhật điểm cuối cho khớp số live, không thêm mẫu realtime
       if (q.isNotEmpty) {
         q.removeLast();
         q.addLast(SensorPoint(now, value));
@@ -216,7 +259,6 @@ class BioProvider extends ChangeNotifier {
     final value = MqttService.parseValue(payload);
     if (value == null) return;
 
-    // Luôn cập nhật số đo realtime (ưu tiên khớp OLED)
     if (topic == AppConfig.topicTemp) {
       temp = value;
       _pushHistorySparse(
@@ -246,6 +288,8 @@ class BioProvider extends ChangeNotifier {
     }
 
     lastUpdate = DateTime.now();
+    // Có telemetry → chắc chắn đang connected
+    if (!mqttConnected) mqttConnected = true;
     notifyListeners();
   }
 
@@ -263,6 +307,7 @@ class BioProvider extends ChangeNotifier {
   void dispose() {
     _staleTimer?.cancel();
     _sub?.cancel();
+    _connSub?.cancel();
     _mqtt.dispose();
     super.dispose();
   }

@@ -7,6 +7,9 @@ import 'package:mqtt_client/mqtt_server_client.dart';
 
 import 'config.dart';
 
+/// Trạng thái kết nối MQTT — BioProvider lắng nghe để sync UI (không đoán từ lần connect()).
+enum MqttConnEvent { connected, disconnected, autoReconnected }
+
 class MqttService {
   MqttService({this.clientPrefix = 'aisinhhoc'});
 
@@ -26,19 +29,23 @@ class MqttService {
   final _messageController = StreamController<Map<String, dynamic>>.broadcast();
   Stream<Map<String, dynamic>> get messages => _messageController.stream;
 
+  final _connController = StreamController<MqttConnEvent>.broadcast();
+  Stream<MqttConnEvent> get connectionEvents => _connController.stream;
+
   Future<bool> connect({
     String brokerUrl = AppConfig.brokerUrl,
     bool force = false,
   }) async {
-    if (_connecting) return false;
+    if (_connecting) return isConnected;
     if (!force && isConnected) {
-      _subscribeAll();
+      resubscribe();
       return true;
     }
 
     _connecting = true;
     lastError = '';
-    await _safeDisconnect();
+    // Chỉ tear-down khi force / lần đầu — tránh đánh nhau với autoReconnect
+    await _safeDisconnect(notify: false);
 
     final uri = Uri.parse(brokerUrl);
     final scheme = uri.scheme.isNotEmpty ? uri.scheme : 'wss';
@@ -56,8 +63,9 @@ class MqttService {
     client.websocketProtocols = MqttClientConstants.protocolsSingleDefault;
     client.logging(on: kDebugMode);
     client.setProtocolV311();
-    client.keepAlivePeriod = 20;
-    client.connectTimeoutPeriod = 20000;
+    // Keepalive dài hơn — khớp Cloudflare / mạng điện thoại (tránh cắt sớm)
+    client.keepAlivePeriod = 40;
+    client.connectTimeoutPeriod = 25000;
     client.autoReconnect = true;
     client.resubscribeOnAutoReconnect = true;
 
@@ -67,17 +75,20 @@ class MqttService {
     client.onConnected = () {
       _isConnected = true;
       _listen();
-      _subscribeAll();
+      resubscribe();
+      _emit(MqttConnEvent.connected);
       if (kDebugMode) print('MQTT: connected $clientId');
     };
     client.onDisconnected = () {
       _isConnected = false;
+      _emit(MqttConnEvent.disconnected);
       if (kDebugMode) print('MQTT: disconnected');
     };
     client.onAutoReconnected = () {
       _isConnected = true;
       _listen();
-      _subscribeAll();
+      resubscribe();
+      _emit(MqttConnEvent.autoReconnected);
       if (kDebugMode) print('MQTT: auto-reconnected');
     };
 
@@ -85,12 +96,12 @@ class MqttService {
         MqttConnectMessage().withClientIdentifier(clientId).startClean();
 
     try {
-      await client.connect().timeout(const Duration(seconds: 22));
+      await client.connect().timeout(const Duration(seconds: 28));
     } catch (e) {
       lastError = e.toString();
       _isConnected = false;
       _connecting = false;
-      await _safeDisconnect();
+      await _safeDisconnect(notify: true);
       return false;
     }
 
@@ -100,19 +111,21 @@ class MqttService {
 
     if (!ok) {
       lastError = client.connectionStatus?.toString() ?? 'connect failed';
-      await _safeDisconnect();
+      await _safeDisconnect(notify: true);
       return false;
     }
 
-    // Subscribe thêm lần nữa sau khi socket ổn định
     await Future<void>.delayed(const Duration(milliseconds: 200));
-    _subscribeAll();
+    resubscribe();
+    _emit(MqttConnEvent.connected);
     return true;
   }
 
-  void _subscribeAll() {
+  /// Socket còn sống nhưng im telemetry → chỉ sub lại, không disconnect.
+  void resubscribe() {
     final client = _client;
     if (client == null) return;
+    if (client.connectionStatus?.state != MqttConnectionState.connected) return;
     for (final topic in AppConfig.subscribeTopics) {
       client.subscribe(topic, MqttQos.atLeastOnce);
       if (kDebugMode) print('MQTT: sub $topic');
@@ -137,11 +150,15 @@ class MqttService {
     });
   }
 
-  Future<void> disconnect() async {
-    await _safeDisconnect();
+  void _emit(MqttConnEvent e) {
+    if (!_connController.isClosed) _connController.add(e);
   }
 
-  Future<void> _safeDisconnect() async {
+  Future<void> disconnect() async {
+    await _safeDisconnect(notify: true);
+  }
+
+  Future<void> _safeDisconnect({bool notify = true}) async {
     _updatesSub?.cancel();
     _updatesSub = null;
     try {
@@ -149,6 +166,7 @@ class MqttService {
     } catch (_) {}
     _client = null;
     _isConnected = false;
+    if (notify) _emit(MqttConnEvent.disconnected);
   }
 
   static double? parseValue(String payload) {
@@ -169,6 +187,7 @@ class MqttService {
 
   void dispose() {
     _messageController.close();
-    _safeDisconnect();
+    _connController.close();
+    _safeDisconnect(notify: false);
   }
 }

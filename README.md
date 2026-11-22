@@ -13,11 +13,12 @@ Giám sát **nhiệt độ · độ ẩm · CO₂** trên OLED 1.3" (ESP32) và 
 
 ## Tài liệu cho giáo viên / khách hàng
 
-Xem thư mục [`docs/`](docs/README.md):
+File Word trong thư mục [`docs/`](docs/) (mở bằng Microsoft Word / Google Docs):
 
-- [Hướng dẫn kết nối WiFi & app](docs/01-huong-dan-ket-noi.md)
-- [Bài giảng lớp cấp 2](docs/02-bai-giang.md)
-- [Sơ đồ mạch & nối dây](docs/03-so-do-mach.md)
+- [`00-Muc-luc.docx`](docs/00-Muc-luc.docx) — mục lục
+- [`01-Huong-dan-ket-noi.docx`](docs/01-Huong-dan-ket-noi.docx) — kết nối WiFi & app
+- [`02-Bai-giang.docx`](docs/02-Bai-giang.docx) — bài giảng lớp cấp 2
+- [`03-So-do-mach.docx`](docs/03-So-do-mach.docx) — sơ đồ mạch & nối dây
 
 ## Firmware
 
