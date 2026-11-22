@@ -21,14 +21,19 @@ class BioProvider extends ChangeNotifier {
     _staleTimer = Timer.periodic(const Duration(seconds: 1), (_) => _checkStale());
   }
 
-  static const int historyMax = 60;
-  /// Chart chỉ lấy mẫu thưa — không cần realtime
-  static const Duration chartSampleEvery = Duration(seconds: 15);
-  static const Duration liveWindow = Duration(seconds: 12);
+  static const int historyMax = 90;
+  /// Mẫu biểu đồ denser để thấy thời gian rõ hơn
+  static const Duration chartSampleEvery = Duration(seconds: 5);
+  /// LIVE nếu còn nhận số trong cửa sổ này (ESP pub ~1.5s)
+  static const Duration liveWindow = Duration(seconds: 18);
+  /// Chỉ reconnect khi im quá lâu — tránh cắt realtime mỗi ~20s
+  static const Duration forceReconnectAfter = Duration(seconds: 55);
 
   late final MqttService _mqtt;
   StreamSubscription<Map<String, dynamic>>? _sub;
   Timer? _staleTimer;
+  bool _reconnectLock = false;
+  DateTime? _lastReconnectAt;
 
   double? temp;
   double? humi;
@@ -75,7 +80,8 @@ class BioProvider extends ChangeNotifier {
   String get lastUpdateLabel {
     if (lastUpdate == null) return '';
     final s = DateTime.now().difference(lastUpdate!).inSeconds;
-    if (s <= 1) return 'Vừa cập nhật';
+    // ESP pub ~1.5s — coi ≤4s là “vừa cập nhật” để UI không nhảy “2s…3s…”
+    if (s <= 4) return 'Vừa cập nhật';
     if (s < 60) return 'Cập nhật $s giây trước';
     final m = s ~/ 60;
     if (m < 60) return 'Cập nhật $m phút trước';
@@ -104,7 +110,7 @@ class BioProvider extends ChangeNotifier {
     await prefs.setString('chipId', AppConfig.chipId);
     _clearTelemetry();
     notifyListeners();
-    await connect(force: true);
+    await connect(force: true, clearFreshness: true);
   }
 
   void _clearTelemetry() {
@@ -121,7 +127,12 @@ class BioProvider extends ChangeNotifier {
     _lastChartCo2 = null;
   }
 
-  Future<void> connect({bool force = false}) async {
+  Future<void> connect({
+    bool force = false,
+    bool clearFreshness = false,
+  }) async {
+    if (_reconnectLock) return;
+    _reconnectLock = true;
     connecting = true;
     error = null;
     status = 'Đang kết nối...';
@@ -130,29 +141,43 @@ class BioProvider extends ChangeNotifier {
     final ok = await _mqtt.connect(force: force);
     mqttConnected = ok;
     connecting = false;
+    _reconnectLock = false;
+    _lastReconnectAt = DateTime.now();
+
     if (!ok) {
       error = _mqtt.lastError.isEmpty ? 'Không kết nối được broker' : _mqtt.lastError;
       status = 'Lỗi MQTT';
     } else {
       status = 'Đã kết nối';
-      // Sau reconnect: không tin số cũ — chờ bản tin mới từ ESP (cùng OLED)
-      lastUpdate = null;
+      // Chỉ xóa freshness khi đổi chip / pull-to-refresh chủ động
+      // Soft reconnect giữ lastUpdate → UI không nhảy “10 giây trước”
+      if (clearFreshness) lastUpdate = null;
     }
     notifyListeners();
   }
 
-  Future<void> reconnect() => connect(force: true);
+  Future<void> reconnect() => connect(force: true, clearFreshness: true);
 
   void _checkStale() {
     if (hasTelemetry || mqttConnected) {
       notifyListeners();
     }
-    if (mqttConnected &&
-        lastUpdate != null &&
-        DateTime.now().difference(lastUpdate!) > const Duration(seconds: 20)) {
-      if (kDebugMode) print('BioProvider: no fresh telemetry → reconnect');
-      reconnect();
+    if (!mqttConnected || lastUpdate == null || _reconnectLock) return;
+
+    final silent = DateTime.now().difference(lastUpdate!);
+    if (silent <= forceReconnectAfter) return;
+
+    // Tránh spam reconnect
+    if (_lastReconnectAt != null &&
+        DateTime.now().difference(_lastReconnectAt!) < const Duration(seconds: 15)) {
+      return;
     }
+
+    if (kDebugMode) {
+      print('BioProvider: silent ${silent.inSeconds}s → soft reconnect');
+    }
+    // Soft: giữ số đo + lastUpdate; chỉ nối lại socket
+    connect(force: true, clearFreshness: false);
   }
 
   void _pushHistorySparse(
@@ -184,12 +209,7 @@ class BioProvider extends ChangeNotifier {
     if (topic == AppConfig.topicOnline) {
       final online = payload.toLowerCase() == 'online';
       deviceOnline = online;
-      if (!online) {
-        // Offline: giữ số cuối nhưng đánh stale
-        notifyListeners();
-      } else {
-        notifyListeners();
-      }
+      notifyListeners();
       return;
     }
 

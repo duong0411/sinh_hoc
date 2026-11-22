@@ -25,7 +25,7 @@ class SensorChartsSection extends StatelessWidget {
         ),
         const SizedBox(height: 6),
         Text(
-          'Lịch sử thưa (~15s/mẫu) · số đo phía trên là realtime',
+          'Trục dưới = giờ:phút · mẫu ~5s · số góc phải là realtime',
           style: TextStyle(
             fontSize: 12.5,
             color: BioTheme.soft.withValues(alpha: 0.65),
@@ -90,12 +90,23 @@ class _ChartCard extends StatelessWidget {
   final double minHint;
   final double maxHint;
 
+  static String _hhmm(DateTime t) {
+    final h = t.hour.toString().padLeft(2, '0');
+    final m = t.minute.toString().padLeft(2, '0');
+    return '$h:$m';
+  }
+
+  static String _hhmmss(DateTime t) {
+    final h = t.hour.toString().padLeft(2, '0');
+    final m = t.minute.toString().padLeft(2, '0');
+    final s = t.second.toString().padLeft(2, '0');
+    return '$h:$m:$s';
+  }
+
   @override
   Widget build(BuildContext context) {
-    // Số góc phải = số hero phía trên (live), không lấy lệch từ history cũ
     final display = liveValue ?? (points.isEmpty ? null : points.last.value);
 
-    // Đảm bảo chart có ≥2 điểm để vẽ; gắn live vào cuối nếu history lệch
     final plot = <SensorPoint>[...points];
     if (liveValue != null) {
       if (plot.isEmpty || plot.last.value != liveValue) {
@@ -103,12 +114,25 @@ class _ChartCard extends StatelessWidget {
       }
     }
     if (plot.length == 1) {
-      plot.insert(0, SensorPoint(plot.first.at.subtract(const Duration(seconds: 1)), plot.first.value));
+      plot.insert(
+        0,
+        SensorPoint(
+          plot.first.at.subtract(const Duration(seconds: 1)),
+          plot.first.value,
+        ),
+      );
     }
     final hasData = plot.length >= 2;
 
+    // Trục X theo thời gian thật (giây epoch) — hiện HH:mm phía dưới
+    final t0 = hasData ? plot.first.at : DateTime.now();
+    double xOf(DateTime at) =>
+        at.difference(t0).inMilliseconds / 1000.0;
+
     double minY = minHint;
     double maxY = maxHint;
+    double minX = 0;
+    double maxX = 1;
     if (hasData) {
       final vals = plot.map((e) => e.value);
       var lo = vals.reduce((a, b) => a < b ? a : b);
@@ -124,7 +148,14 @@ class _ChartCard extends StatelessWidget {
       }
       minY = lo;
       maxY = hi;
+      minX = xOf(plot.first.at);
+      maxX = xOf(plot.last.at);
+      if (maxX - minX < 1) maxX = minX + 1;
     }
+
+    // ~4 mốc thời gian trên trục X
+    final xSpan = maxX - minX;
+    final xInterval = (xSpan / 3).clamp(1.0, 3600.0);
 
     final chartKey = ValueKey(
       '${title}_${plot.length}_${display?.toStringAsFixed(2) ?? '-'}_'
@@ -132,7 +163,7 @@ class _ChartCard extends StatelessWidget {
     );
 
     return Container(
-      padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
       decoration: BoxDecoration(
         color: BioTheme.bgMid.withValues(alpha: 0.55),
         borderRadius: BorderRadius.circular(16),
@@ -169,17 +200,28 @@ class _ChartCard extends StatelessWidget {
               ),
             ],
           ),
-          const SizedBox(height: 12),
+          if (hasData) ...[
+            const SizedBox(height: 4),
+            Text(
+              '${_hhmmss(plot.first.at)}  →  ${_hhmmss(plot.last.at)}',
+              style: TextStyle(
+                fontSize: 11,
+                color: BioTheme.soft.withValues(alpha: 0.5),
+              ),
+            ),
+          ],
+          const SizedBox(height: 10),
           SizedBox(
-            height: 140,
+            height: 156,
             child: hasData
                 ? LineChart(
                     key: chartKey,
                     LineChartData(
                       minY: minY,
                       maxY: maxY,
-                      minX: 0,
-                      maxX: (plot.length - 1).toDouble(),
+                      minX: minX,
+                      maxX: maxX,
+                      clipData: const FlClipData.all(),
                       gridData: FlGridData(
                         show: true,
                         drawVerticalLine: false,
@@ -197,8 +239,32 @@ class _ChartCard extends StatelessWidget {
                         rightTitles: const AxisTitles(
                           sideTitles: SideTitles(showTitles: false),
                         ),
-                        bottomTitles: const AxisTitles(
-                          sideTitles: SideTitles(showTitles: false),
+                        bottomTitles: AxisTitles(
+                          sideTitles: SideTitles(
+                            showTitles: true,
+                            reservedSize: 22,
+                            interval: xInterval,
+                            getTitlesWidget: (v, meta) {
+                              // Bỏ nhãn sát mép để khỏi chồng
+                              if ((v - meta.min).abs() < 0.01 ||
+                                  (v - meta.max).abs() < 0.01) {
+                                return const SizedBox.shrink();
+                              }
+                              final t = t0.add(
+                                Duration(milliseconds: (v * 1000).round()),
+                              );
+                              return Padding(
+                                padding: const EdgeInsets.only(top: 4),
+                                child: Text(
+                                  _hhmm(t),
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    color: BioTheme.soft.withValues(alpha: 0.55),
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
                         ),
                         leftTitles: AxisTitles(
                           sideTitles: SideTitles(
@@ -220,25 +286,26 @@ class _ChartCard extends StatelessWidget {
                         enabled: true,
                         touchTooltipData: LineTouchTooltipData(
                           getTooltipColor: (_) => BioTheme.bgDeep,
-                          getTooltipItems: (spots) => spots
-                              .map(
-                                (s) => LineTooltipItem(
-                                  '${s.y.toStringAsFixed(s.y.abs() >= 100 ? 0 : 1)} $unit',
-                                  TextStyle(
-                                    color: color,
-                                    fontWeight: FontWeight.w600,
-                                    fontSize: 12,
-                                  ),
-                                ),
-                              )
-                              .toList(),
+                          getTooltipItems: (spots) => spots.map((s) {
+                            final t = t0.add(
+                              Duration(milliseconds: (s.x * 1000).round()),
+                            );
+                            return LineTooltipItem(
+                              '${_hhmmss(t)}\n'
+                              '${s.y.toStringAsFixed(s.y.abs() >= 100 ? 0 : 1)} $unit',
+                              TextStyle(
+                                color: color,
+                                fontWeight: FontWeight.w600,
+                                fontSize: 12,
+                              ),
+                            );
+                          }).toList(),
                         ),
                       ),
                       lineBarsData: [
                         LineChartBarData(
                           spots: [
-                            for (var i = 0; i < plot.length; i++)
-                              FlSpot(i.toDouble(), plot[i].value),
+                            for (final p in plot) FlSpot(xOf(p.at), p.value),
                           ],
                           isCurved: true,
                           curveSmoothness: 0.2,

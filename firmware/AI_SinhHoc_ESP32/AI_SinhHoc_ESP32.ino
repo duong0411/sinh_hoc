@@ -44,8 +44,6 @@
 #define PIN_SENS_SDA  25
 #define PIN_SENS_SCL  26
 #define PIN_DHT       27
-#define PIN_BOOT_BTN  0
-#define BOOT_HOLD_MS  3000
 
 #define OLED_W        128
 #define OLED_H        64
@@ -69,11 +67,16 @@ const byte DNS_PORT = 53;
 
 #define EEPROM_SIZE   512
 #define MAX_WIFI      5
-#define READ_MS       2500
-#define TELEMETRY_MS  2500
+#define READ_MS       1500
+#define TELEMETRY_MS  1500
 #define HEARTBEAT_MS  30000
 #define RECONNECT_MS  10000
 #define OLED_MS       1000
+
+// Lọc nhiễu eCO2 ENS160: median-of-5 + EMA + giới hạn nhảy đột biến
+#define CO2_MEDIAN_N     5
+#define CO2_EMA_ALPHA    0.28f   // 0..1 — càng nhỏ càng mượt
+#define CO2_MAX_STEP_PPM 60      // ppm tối đa mỗi lần đọc (~1.5s)
 
 struct WifiEntry {
   char ssid[33];
@@ -102,6 +105,14 @@ uint16_t bioCo2 = 0;
 bool ensOk = false;
 bool ahtOk = false;
 bool oledOk = false;
+
+// Bộ đệm lọc CO₂
+uint16_t co2RawBuf[CO2_MEDIAN_N];
+uint8_t co2RawCount = 0;
+uint8_t co2RawIdx = 0;
+float co2Ema = 0;
+bool co2EmaReady = false;
+uint16_t co2Filtered = 0;
 
 Adafruit_GFX* oledGfx() {
   if (oledDriver == OLED_SH1106) return &oledSh;
@@ -171,7 +182,7 @@ bool initOled() {
 }
 
 bool portalActive = false;
-bool pendingStaConnect = false;  // giữ tương thích (không dùng — connect = lưu + restart)
+// Portal chuẩn SmartHome AloT: AP_STA, thử WiFi trước khi lưu, không nút vật lý
 
 unsigned long tRead = 0;
 unsigned long lastTelemetry = 0;
@@ -183,19 +194,16 @@ bool wssReady = false;
 bool mqttLoggedOk = false;
 int wifiRetries = 0;
 
-unsigned long bootPressStart = 0;
-bool bootWasPressed = false;
-bool bootHoldUiShown = false;
-
-#define DOUBLE_RESET_MAGIC 0x12345678
-RTC_DATA_ATTR uint32_t rtcMagic = 0;
-bool isDoubleReset = false;
+// Đổi chỗ / WiFi mới: không cần nút / tắt nguồn.
+// Không thấy SSID đã lưu trong quét → tự mở portal để khách cấu hình.
 
 void drawOled();
 void pubAll();
 void pubOnline();
 void reconnectMQTT();
 void startPortal();
+static bool ensureSoftAP();
+bool connectBestWifi(bool* outNoSavedVisible = nullptr);
 
 static bool wifiSsidOk(const char* ssid) {
   if (!ssid || !ssid[0]) return false;
@@ -280,54 +288,163 @@ void addOrUpdateWifi(const String& ssid, const String& pass) {
   saveWifiList();
 }
 
-// Chờ STA — thoát sớm nếu sai mật khẩu / không thấy SSID
-bool waitWifiConnected(uint16_t maxMs = 15000) {
-  const uint16_t step = 100;
-  uint16_t waited = 0;
-  while (waited < maxMs) {
-    wl_status_t st = WiFi.status();
-    if (st == WL_CONNECTED) return true;
-    if (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL) {
-      Serial.printf("\n[WiFi] fail status=%d\n", (int)st);
-      return false;
-    }
-    delay(step);
-    waited += step;
-    if ((waited % 500) == 0) Serial.print('.');
+static bool ensureSoftAP() {
+  // AP mở (không mật khẩu) — khách nối dễ; channel 1 ổn định với hầu hết điện thoại
+  WiFi.mode(WIFI_AP_STA);
+  delay(30);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  bool ok = WiFi.softAP(AP_SSID, nullptr, 1, 0, 8);
+  if (!ok) {
+    delay(80);
+    ok = WiFi.softAP(AP_SSID, nullptr, 1, 0, 8);
   }
-  return WiFi.status() == WL_CONNECTED;
+  return ok && WiFi.softAPIP() == apIP;
 }
 
-bool tryWifiCreds(const char* ssid, const char* pass) {
-  if (!wifiSsidOk(ssid)) return false;
+static bool tryWifiCreds(const char* ssid, const char* pass, int attempts = 24) {
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(150);
   Serial.printf("[WiFi] STA begin '%s'\n", ssid);
+  WiFi.begin(ssid, pass);
+  for (int i = 0; i < attempts && WiFi.status() != WL_CONNECTED; i++) {
+    delay(500);
+    Serial.print('.');
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] OK IP: " + WiFi.localIP().toString());
+    return true;
+  }
+  Serial.printf("\n[WiFi] FAIL status=%d\n", (int)WiFi.status());
+  return false;
+}
+
+// Quét → chỉ nối SSID đã lưu ĐANG THẤY.
+// Ship sang nhà khách: không thấy WiFi cũ → false + outNoSavedVisible=true → mở portal ngay.
+bool connectBestWifi(bool* outNoSavedVisible) {
+  if (outNoSavedVisible) *outNoSavedVisible = false;
+  Serial.println(F("\n[WiFi] Quet mang..."));
   WiFi.persistent(false);
   WiFi.setSleep(false);
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true, true);
   delay(200);
-  WiFi.begin(ssid, pass);
-  if (waitWifiConnected(15000)) {
-    Serial.println("\n[WiFi] OK IP: " + WiFi.localIP().toString());
-    return true;
+  if (wifiCount <= 0) {
+    if (outNoSavedVisible) *outNoSavedVisible = true;
+    return false;
   }
-  Serial.printf("\n[WiFi] FAIL status=%d\n", (int)WiFi.status());
-  WiFi.disconnect(true, true);
-  delay(100);
-  return false;
-}
 
-bool connectBestWifi() {
-  if (wifiCount <= 0) return false;
+  int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false);
+  if (n < 0) {
+    Serial.println(F("[WiFi] scan loi — thu lai sau"));
+    return false;
+  }
 
-  // Ưu tiên mạng mới nhất (vừa lưu từ portal) — không phụ thuộc scan
-  int last = wifiCount - 1;
-  if (tryWifiCreds(wifiList[last].ssid, wifiList[last].pass)) return true;
+  // Chỉ các SSID đã lưu và đang xuất hiện (tránh mù thử WiFi chỗ cũ khi đã chuyển chỗ)
+  int order[MAX_WIFI];
+  int orderCount = 0;
+  int rssiOf[MAX_WIFI];
+  for (int w = 0; w < wifiCount; w++) {
+    if (!wifiSsidOk(wifiList[w].ssid)) continue;
+    int best = -999;
+    bool seen = false;
+    for (int i = 0; i < n; i++) {
+      if (WiFi.SSID(i) == wifiList[w].ssid) {
+        seen = true;
+        if (WiFi.RSSI(i) > best) best = WiFi.RSSI(i);
+      }
+    }
+    if (!seen) continue;
+    order[orderCount] = w;
+    rssiOf[orderCount] = best;
+    orderCount++;
+  }
+  WiFi.scanDelete();
+  Serial.printf("[WiFi] scan=%d savedVisible=%d/%d\n", n, orderCount, wifiCount);
 
-  for (int w = last - 1; w >= 0; w--) {
+  if (orderCount == 0) {
+    Serial.println(F("[WiFi] Khong thay SSID da luu — mang moi / chuyen cho → portal"));
+    if (outNoSavedVisible) *outNoSavedVisible = true;
+    return false;
+  }
+
+  // Sắp xếp RSSI cao → thấp (insertion sort nhỏ)
+  for (int i = 1; i < orderCount; i++) {
+    int ow = order[i], orr = rssiOf[i], j = i;
+    while (j > 0 && rssiOf[j - 1] < orr) {
+      order[j] = order[j - 1];
+      rssiOf[j] = rssiOf[j - 1];
+      j--;
+    }
+    order[j] = ow;
+    rssiOf[j] = orr;
+  }
+
+  for (int i = 0; i < orderCount; i++) {
+    int w = order[i];
     if (tryWifiCreds(wifiList[w].ssid, wifiList[w].pass)) return true;
   }
   return false;
+}
+
+// Mở portal cho khách cấu hình WiFi mới (không cần thao tác vật lý)
+static void openPortalForNewWifi(bool clearOldSaved) {
+  if (clearOldSaved && wifiCount > 0) {
+    Serial.println(F("[WiFi] Xoa SSID cho cu — cho khach nhap mang moi"));
+    wifiCount = 0;
+    memset(wifiList, 0, sizeof(wifiList));
+    saveWifiList();
+  }
+  startPortal();
+}
+
+// Median nhỏ (insertion) — chống spike ENS160
+static uint16_t medianU16(uint16_t* arr, uint8_t n) {
+  uint16_t tmp[CO2_MEDIAN_N];
+  for (uint8_t i = 0; i < n; i++) tmp[i] = arr[i];
+  for (uint8_t i = 1; i < n; i++) {
+    uint16_t v = tmp[i];
+    int j = i;
+    while (j > 0 && tmp[j - 1] > v) {
+      tmp[j] = tmp[j - 1];
+      j--;
+    }
+    tmp[j] = v;
+  }
+  return tmp[n / 2];
+}
+
+// Lọc eCO2: median → giới hạn bước → EMA → sàn 400 ppm
+static uint16_t filterCo2(uint16_t raw) {
+  if (raw == 0) return bioCo2;
+  if (raw < 400) raw = 400;
+  if (raw > 5000) raw = 5000;  // trần thực tế phòng học
+
+  co2RawBuf[co2RawIdx] = raw;
+  co2RawIdx = (co2RawIdx + 1) % CO2_MEDIAN_N;
+  if (co2RawCount < CO2_MEDIAN_N) co2RawCount++;
+
+  uint16_t med = medianU16(co2RawBuf, co2RawCount);
+
+  // Giới hạn nhảy đột biến so với giá trị đã lọc trước đó
+  if (co2EmaReady) {
+    int32_t delta = (int32_t)med - (int32_t)co2Filtered;
+    if (delta > CO2_MAX_STEP_PPM) med = co2Filtered + CO2_MAX_STEP_PPM;
+    else if (delta < -CO2_MAX_STEP_PPM) med = co2Filtered - CO2_MAX_STEP_PPM;
+  }
+
+  if (!co2EmaReady) {
+    co2Ema = (float)med;
+    co2EmaReady = true;
+  } else {
+    co2Ema = CO2_EMA_ALPHA * (float)med + (1.0f - CO2_EMA_ALPHA) * co2Ema;
+  }
+
+  co2Filtered = (uint16_t)(co2Ema + 0.5f);
+  if (co2Filtered < 400) co2Filtered = 400;
+  return co2Filtered;
 }
 
 // ── Cảm biến ─────────────────────────────────────────────────
@@ -347,12 +464,21 @@ void readSensors() {
     }
   }
 
-  // Luôn lấy eCO2 hiện tại để OLED và MQTT cùng một số
+  // Bù nhiệt/ẩm cho ENS160 → eCO2 ổn định hơn (datasheet)
+  if (ensOk && !isnan(bioTemp) && !isnan(bioHum)) {
+    ens160.setTempCompensationCelsius(bioTemp);
+    ens160.setRHCompensationFloat(bioHum);
+  }
+
   if (ensOk) {
     ens160.checkDataStatus();
-    uint16_t c = ens160.getECO2();
-    if (c > 0) {
-      bioCo2 = c < 400 ? 400 : c;
+    uint16_t raw = ens160.getECO2();
+    if (raw > 0) {
+      uint16_t filtered = filterCo2(raw);
+      bioCo2 = filtered;
+      Serial.printf("T=%.1fC H=%.0f%% CO2=%u ppm (raw=%u)\n",
+                    bioTemp, bioHum, (unsigned)bioCo2, (unsigned)raw);
+      return;
     }
   }
 
@@ -385,11 +511,11 @@ void drawOledPortal() {
   if (!g) return;
   oledClear();
   g->setTextColor(SSD1306_WHITE);
-  oledPrintCentered(g, 4, 1, "CAI DAT WIFI");
-  g->drawFastHLine(16, 16, 96, SSD1306_WHITE);
-  oledPrintCentered(g, 24, 1, "Noi dien thoai:");
-  oledPrintCentered(g, 36, 2, "AI_SinhHoc");
-  oledPrintCentered(g, 56, 1, "192.168.4.1");
+  oledPrintCentered(g, 2, 1, "CAI DAT WIFI");
+  g->drawFastHLine(16, 14, 96, SSD1306_WHITE);
+  oledPrintCentered(g, 18, 1, "Noi DT:");
+  oledPrintCentered(g, 30, 2, "AI_SinhHoc");
+  oledPrintCentered(g, 52, 1, "192.168.4.1");
   oledShow();
 }
 
@@ -473,21 +599,23 @@ void pubAll() {
 bool mqttStarted = false;
 bool mqttNeedConnect = false;
 
+static void openWss() {
+  wsClient.setExtraHeaders("Sec-WebSocket-Protocol: mqtt");
+  wsClient.setReconnectInterval(2000);
+  wsClient.beginSSL(MQTT_HOST, MQTT_PORT, MQTT_PATH);
+  Serial.printf("[WSS] beginSSL %s:%d%s\n", MQTT_HOST, MQTT_PORT, MQTT_PATH);
+  wssReady = false;
+}
+
 void startMqttStack() {
   if (mqttStarted) return;
-  Serial.printf("[WSS] beginSSL %s:%d%s\n", MQTT_HOST, MQTT_PORT, MQTT_PATH);
-  // Header TRƯỚC begin — bắt buộc để subprotocol mqtt
-  wsClient.setExtraHeaders("Sec-WebSocket-Protocol: mqtt");
-  wsClient.setReconnectInterval(3000);
-  wsClient.enableHeartbeat(15000, 4000, 2);
-  wsClient.beginSSL(MQTT_HOST, MQTT_PORT, MQTT_PATH);
-  // begin() gắn onEvent nhận BIN MQTT — để SAU cùng, không ghi đè
+  // Thứ tự đã từng OK trên board này: header → beginSSL → mqtt.begin (onEvent BIN)
+  openWss();
   mqttClient.begin(wsClient);
   mqttClient.setTimeout(15000);
   mqttClient.setKeepAliveTimeout(20);
   mqttClient.setKeepAliveSendInterval(8000);
   mqttStarted = true;
-  wssReady = false;
   mqttNeedConnect = true;
   mqttLoggedOk = false;
 }
@@ -505,23 +633,42 @@ void stopMqttStack() {
 
 void reconnectMQTT() {
   if (!mqttStarted) startMqttStack();
-  if (!wssReady) return;
-  if (mqttClient.isConnected()) {
-    mqttLoggedOk = true;
+
+  // Chờ WSS (auto reconnect). Không beginSSL trùng khi đang handshake.
+  if (!wsClient.isConnected()) {
+    wssReady = false;
+    wsClient.loop();
     return;
   }
+  wssReady = true;
+
+  if (mqttClient.isConnected()) {
+    mqttLoggedOk = true;
+    mqttNeedConnect = false;
+    return;
+  }
+
   Serial.print(F("MQTT WSS ... "));
   String clientId = String("ESP32-BIO-") + String((uint32_t)ESP.getEfuseMac(), HEX) +
                     "-" + String((uint32_t)millis(), HEX);
   String lwt = String("tele/") + CHIP_ID + "/status";
-  mqttClient.setWill(lwt, "offline", true, 1);
+  mqttClient.setWill(lwt, "offline", true, 0);
+  mqttClient.setTimeout(15000);
+
   if (!mqttClient.connect(clientId, "", "")) {
-    Serial.printf("fail err=%d rc=%d\n",
+    Serial.printf("fail err=%d rc=%d — reopen WSS\n",
                   (int)mqttClient.getLastError(),
                   (int)mqttClient.getReturnCode());
     mqttLoggedOk = false;
+    mqttNeedConnect = true;
+    wssReady = false;
+    // connect() fail gọi close() → phải beginSSL lại
+    delay(100);
+    openWss();
+    mqttClient.begin(wsClient);
     return;
   }
+
   Serial.println(F("OK"));
   mqttLoggedOk = true;
   mqttNeedConnect = false;
@@ -546,22 +693,24 @@ button{padding:12px;width:100%;background:#2d6a4f;color:#fff;border:none;border-
 #st{margin-top:12px;font-size:14px;display:none;padding:10px;border-radius:8px;background:#14532d}
 </style></head><body><div class="c">
 <h2>AI SINH HOC</h2>
-<p class="sub">Cau hinh WiFi (chi mang 2.4GHz). Giữ BOOT 3s de mo lai portal.</p>
+<p class="sub">Chi mang <b>2.4GHz</b> (khong dung 5GHz). May thu ket noi truoc khi luu. Len trang nay = may dang cho cau hinh WiFi nha ban.</p>
 <button class="scan" onclick="scan()">Quet mang WiFi</button>
 <div id="w"></div>
-<input id="s" placeholder="Ten WiFi" autocomplete="off">
-<input type="password" id="p" placeholder="Mat khau" autocomplete="off">
-<button onclick="conn()">Luu & Ket noi</button>
+<input id="s" placeholder="Ten WiFi nha ban" autocomplete="off" autocapitalize="off">
+<input type="password" id="p" placeholder="Mat khau WiFi" autocomplete="off">
+<button onclick="conn()">Ket noi</button>
 <div id="st"></div>
 </div>
 <script>
+function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');}
 function scan(){
-  document.getElementById('w').innerHTML='Dang quet...';
-  fetch('/scan').then(r=>r.json()).then(l=>{
-    document.getElementById('w').innerHTML=l.map(n=>
-      `<div class="item" onclick="document.getElementById('s').value=this.dataset.s" data-s="${n.ssid.replace(/"/g,'&quot;')}">${n.ssid} (${n.rssi} dBm)</div>`
-    ).join('');
-  }).catch(()=>document.getElementById('w').innerHTML='Loi quet mang');
+  document.getElementById('w').innerHTML='Dang quet (~6s)... giu dien thoai noi AI_SinhHoc';
+  fetch('/scan').then(r=>{ if(!r.ok) throw 0; return r.json(); }).then(l=>{
+    const list=(l||[]).filter(n=>n && n.ssid);
+    document.getElementById('w').innerHTML=list.map(n=>
+      `<div class="item" onclick="document.getElementById('s').value=this.dataset.s" data-s="${esc(n.ssid)}">${esc(n.ssid)} (${n.rssi} dBm)</div>`
+    ).join('')||'Khong thay mang 2.4GHz — thu Quet lai hoac go ten WiFi thu cong';
+  }).catch(()=>document.getElementById('w').innerHTML='Loi quet — noi lai WiFi <b>AI_SinhHoc</b> roi bam Quet lai');
 }
 function conn(){
   const s=document.getElementById('s').value.trim();
@@ -569,14 +718,17 @@ function conn(){
   if(!s){alert('Nhap ten WiFi');return;}
   const st=document.getElementById('st');
   st.style.display='block';
-  st.textContent='Dang luu... may se restart va ket noi WiFi.';
-  // Form POST — captive portal dien thoai on dinh hon fetch
-  const f=document.createElement('form');
-  f.method='POST'; f.action='/connect';
-  const a=document.createElement('input'); a.name='ssid'; a.value=s; f.appendChild(a);
-  const b=document.createElement('input'); b.name='pass'; b.value=p; f.appendChild(b);
-  document.body.appendChild(f); f.submit();
+  st.textContent='Dang thu ket noi (~15s). Khong doi WiFi dien thoai trong luc nay...';
+  fetch('/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p)})
+  .then(r=>r.json()).then(d=>{
+    if(d.ok){ st.textContent='OK — da luu WiFi, may restart. OLED se het man CAI DAT WIFI.'; }
+    else { st.textContent='Loi: '+(d.message||'sai mat khau / khong phai 2.4GHz'); }
+  }).catch(()=>{
+    st.textContent='Mat ket noi AP. Neu OLED het man CAI DAT WIFI → thanh cong. Neu van thay portal → noi lai AI_SinhHoc va thu lai.';
+  });
 }
+scan();
 </script></body></html>
 )rawhtml";
 
@@ -596,99 +748,134 @@ void handleNotFound() {
 }
 
 void handleScan() {
-  // Giữ AP, bật thêm STA chỉ để scan — rồi về AP thuần
+  // Giữ AP_STA; sau scan ESP32 hay tụt softAP → restore trước khi trả JSON
   WiFi.mode(WIFI_AP_STA);
-  delay(80);
-  // async=false, show_hidden=false; timeout ms tùy SDK
+  ensureSoftAP();
+  delay(50);
   int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false);
-  String json = "[";
+
+  String bestSsid[24];
+  int bestRssi[24];
+  int out = 0;
   if (n > 0) {
-    // Giới hạn 24 mạng — JSON nhỏ, portal không treo
-    int lim = n > 24 ? 24 : n;
-    for (int i = 0; i < lim; i++) {
-      if (i) json += ',';
+    for (int i = 0; i < n; i++) {
       String ssid = WiFi.SSID(i);
-      ssid.replace("\\", "\\\\");
-      ssid.replace("\"", "\\\"");
-      json += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
+      if (!ssid.length()) continue;
+      int rssi = WiFi.RSSI(i);
+      int found = -1;
+      for (int j = 0; j < out; j++) {
+        if (bestSsid[j] == ssid) { found = j; break; }
+      }
+      if (found >= 0) {
+        if (rssi > bestRssi[found]) bestRssi[found] = rssi;
+      } else if (out < 24) {
+        bestSsid[out] = ssid;
+        bestRssi[out] = rssi;
+        out++;
+      }
     }
   }
   WiFi.scanDelete();
-  json += "]";
-  // Khôi phục AP + cấu hình IP (một số board mất softAPConfig sau AP_STA)
-  WiFi.mode(WIFI_AP);
-  delay(30);
-  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-  if (WiFi.softAPIP() != apIP) {
-    WiFi.softAP(AP_SSID, nullptr, 1, 0, 4);
-    WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  delay(40);
+  ensureSoftAP();
+  delay(40);
+  ensureSoftAP();
+
+  // RSSI cao → thấp
+  for (int i = 1; i < out; i++) {
+    String s = bestSsid[i];
+    int r = bestRssi[i], j = i;
+    while (j > 0 && bestRssi[j - 1] < r) {
+      bestSsid[j] = bestSsid[j - 1];
+      bestRssi[j] = bestRssi[j - 1];
+      j--;
+    }
+    bestSsid[j] = s;
+    bestRssi[j] = r;
   }
+
+  String json = "[";
+  for (int i = 0; i < out; i++) {
+    if (i) json += ',';
+    String esc = bestSsid[i];
+    esc.replace("\\", "\\\\");
+    esc.replace("\"", "\\\"");
+    json += "{\"ssid\":\"" + esc + "\",\"rssi\":" + String(bestRssi[i]) + "}";
+  }
+  json += "]";
+  Serial.printf("[PORTAL] scan -> %d mang\n", out);
   webServer.sendHeader("Cache-Control", "no-cache");
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
   webServer.send(200, "application/json", json);
 }
 
 void handleConnect() {
+  // Thử STA trước → chỉ lưu + restart khi OK (tránh lưu sai mật khẩu)
   String ssid = webServer.arg("ssid");
   String pass = webServer.arg("pass");
   ssid.trim();
   if (!ssid.length()) {
-    webServer.send(200, "text/html",
-      "<html><body style='background:#071a12;color:#fff;padding:24px;font-family:sans-serif'>"
-      "<h2>Loi</h2><p>Chua nhap ten WiFi.</p>"
-      "<a style='color:#52b788' href='/'>Quay lai</a></body></html>");
+    webServer.send(200, "application/json", "{\"ok\":false,\"message\":\"chua nhap ten WiFi\"}");
     return;
   }
   if (ssid.length() > 32) {
-    webServer.send(200, "text/html",
-      "<html><body style='background:#071a12;color:#fff;padding:24px;font-family:sans-serif'>"
-      "<h2>Loi</h2><p>Ten WiFi qua dai (toi da 32 ky tu).</p>"
-      "<a style='color:#52b788' href='/'>Quay lai</a></body></html>");
+    webServer.send(200, "application/json", "{\"ok\":false,\"message\":\"ten WiFi qua dai\"}");
+    return;
+  }
+  if (pass.length() > 63) {
+    webServer.send(200, "application/json", "{\"ok\":false,\"message\":\"mat khau qua dai\"}");
     return;
   }
 
-  // Lưu EEPROM trước → hiện trang OK trên AP → restart → STA thuần
-  addOrUpdateWifi(ssid, pass);
-  Serial.printf("[PORTAL] Da luu '%s' (pass len=%u) — restart\n",
-                ssid.c_str(), (unsigned)pass.length());
+  Serial.printf("[PORTAL] Thu ket noi '%s'...\n", ssid.c_str());
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.mode(WIFI_AP_STA);
+  ensureSoftAP();
+  // Ngắt STA cũ (nếu có) rồi begin — giữ softAP cho điện thoại
+  WiFi.disconnect(false, false);
+  delay(100);
+  ensureSoftAP();
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  for (int i = 0; i < 36 && WiFi.status() != WL_CONNECTED; i++) {
+    delay(150);
+    dnsServer.processNextRequest();
+    webServer.handleClient();
+    delay(350);
+    if ((i % 6) == 5) ensureSoftAP();  // giữ AP sống khi STA handshake
+  }
 
-  String html =
-    "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>Da luu</title></head>"
-    "<body style='background:#071a12;color:#e8f5e9;font-family:sans-serif;padding:28px;text-align:center'>"
-    "<h2 style='color:#52b788'>Da luu WiFi!</h2>"
-    "<p>May dang <b>restart</b> de ket noi <b>";
-  html += ssid;
-  html +=
-    "</b>.</p>"
-    "<p style='color:#95d5b2'>Doi 15–20 giay. Mat mang AI_SinhHoc la binh thuong.</p>"
-    "<p>Neu that bai: noi lai <b>AI_SinhHoc</b>, kiem tra mat khau (dung <b>2.4GHz</b>).</p>"
-    "<p>Hoac giu nut <b>BOOT 3 giay</b> de mo lai portal.</p>"
-    "</body></html>";
+  if (WiFi.status() == WL_CONNECTED) {
+    addOrUpdateWifi(ssid, pass);
+    Serial.printf("[PORTAL] OK %s — luu EEPROM + restart\n",
+                  WiFi.localIP().toString().c_str());
+    webServer.send(200, "application/json", "{\"ok\":true}");
+    delay(1500);  // cho phone nhận JSON trước khi AP tắt
+    ESP.restart();
+  }
 
-  webServer.send(200, "text/html", html);
-  webServer.client().flush();
-  delay(2000);  // đủ thời gian điện thoại tải trang
-  ESP.restart();
+  Serial.printf("[PORTAL] FAIL status=%d — khong luu\n", (int)WiFi.status());
+  WiFi.disconnect(true, false);
+  delay(100);
+  ensureSoftAP();
+  delay(50);
+  ensureSoftAP();
+  webServer.send(200, "application/json",
+                 "{\"ok\":false,\"message\":\"sai mat khau hoac khong phai 2.4GHz\"}");
 }
 
 void startPortal() {
   portalActive = true;
-  pendingStaConnect = false;
-  Serial.println(F("\n[PORTAL] Khoi tao AP..."));
+  if (mqttStarted) stopMqttStack();
+  Serial.println(F("\n[PORTAL] AP_STA AI_SinhHoc — cau hinh WiFi khach"));
 
   WiFi.persistent(false);
-  WiFi.disconnect(true, true);
-  delay(50);
-  WiFi.mode(WIFI_OFF);
+  WiFi.setSleep(false);
+  WiFi.disconnect(true, false);
   delay(80);
-  WiFi.mode(WIFI_AP);
-  delay(50);
-  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-  // AP mở — nullptr ổn định hơn chuỗi rỗng trên ESP32
-  bool apOk = WiFi.softAP(AP_SSID, nullptr, 1, 0, 4);
-  Serial.printf("[PORTAL] softAP=%s SSID=%s IP=%s\n",
-                apOk ? "OK" : "FAIL", AP_SSID, WiFi.softAPIP().toString().c_str());
+  bool apOk = ensureSoftAP();
+  Serial.printf("[PORTAL] softAP=%s IP=%s\n",
+                apOk ? "OK" : "FAIL", WiFi.softAPIP().toString().c_str());
 
   dnsServer.stop();
   dnsServer.start(DNS_PORT, "*", apIP);
@@ -696,67 +883,18 @@ void startPortal() {
   webServer.on("/", HTTP_GET, handleRoot);
   webServer.on("/scan", HTTP_GET, handleScan);
   webServer.on("/connect", HTTP_POST, handleConnect);
-  // Android captive
   webServer.on("/generate_204", HTTP_GET, handleCaptiveProbe);
   webServer.on("/gen_204", HTTP_GET, handleCaptiveProbe);
   webServer.on("/connecttest.txt", HTTP_GET, handleCaptiveProbe);
-  // Windows NCSI
   webServer.on("/ncsi.txt", HTTP_GET, handleCaptiveProbe);
   webServer.on("/fwlink/", HTTP_GET, handleCaptiveProbe);
-  // iOS / macOS captive
   webServer.on("/hotspot-detect.html", HTTP_GET, handleCaptiveProbe);
   webServer.on("/library/test/success.html", HTTP_GET, handleCaptiveProbe);
   webServer.on("/canonical.html", HTTP_GET, handleCaptiveProbe);
   webServer.onNotFound(handleNotFound);
   webServer.begin();
 
-  Serial.println(F("[PORTAL] Noi WiFi 'AI_SinhHoc' → http://192.168.4.1"));
-}
-
-// ── Double reset / BOOT hold ─────────────────────────────────
-void checkDoubleReset() {
-  if (rtcMagic == DOUBLE_RESET_MAGIC) {
-    isDoubleReset = true;
-    rtcMagic = 0;
-    wifiCount = 0;
-    memset(wifiList, 0, sizeof(wifiList));
-    saveWifiList();
-    Serial.println(F("DOUBLE RESET — xoa WiFi, mo Portal"));
-  } else {
-    isDoubleReset = false;
-    rtcMagic = DOUBLE_RESET_MAGIC;
-  }
-}
-
-void clearDoubleResetFlag() {
-  if (rtcMagic == DOUBLE_RESET_MAGIC) rtcMagic = 0;
-}
-
-void handleBootButton() {
-  // Chỉ dùng khi chưa vào portal — giữ BOOT 3s → xóa WiFi + mở AP
-  if (portalActive) return;
-  bool pressed = digitalRead(PIN_BOOT_BTN) == LOW;
-  if (pressed) {
-    if (!bootWasPressed) {
-      bootWasPressed = true;
-      bootHoldUiShown = false;
-      bootPressStart = millis();
-      Serial.println(F("[BOOT] Giu 3s de xoa WiFi + mo Portal"));
-    }
-    if (!bootHoldUiShown && millis() - bootPressStart >= BOOT_HOLD_MS) {
-      bootHoldUiShown = true;
-      Serial.println(F("[BOOT] Xoa WiFi + mo Portal"));
-      wifiCount = 0;
-      memset(wifiList, 0, sizeof(wifiList));
-      saveWifiList();
-      WiFi.disconnect(true, true);
-      bootWasPressed = false;
-      startPortal();
-    }
-  } else {
-    bootWasPressed = false;
-    bootHoldUiShown = false;
-  }
+  Serial.println(F("[PORTAL] Dien thoai noi WiFi AI_SinhHoc → http://192.168.4.1"));
 }
 
 // ── Setup / Loop ─────────────────────────────────────────────
@@ -765,8 +903,7 @@ void setup() {
   delay(200);
   Serial.println(F("\n=== AI Sinh Hoc ESP32 ==="));
   Serial.println(F("OLED I2C0 21/22 | ENS160 Wire1 25/26 | DHT11 GPIO27"));
-
-  pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
+  Serial.println(F("Portal: tu mo khi khong thay WiFi da luu (chuyen cho khach)"));
 
   // OLED — Wire (I2C0): GPIO21=SDA, GPIO22=SCL
   oledOk = initOled();
@@ -793,25 +930,50 @@ void setup() {
   drawOled();
 
   loadWifiList();
-  checkDoubleReset();
 
-  if (isDoubleReset) {
-    startPortal();
-  } else if (!(wifiCount > 0 && connectBestWifi())) {
+  // Đặt 1 chỉ khi test portal tại xưởng; bàn giao phải = 0 (giữ WiFi đã lưu trong EEPROM)
+#ifndef FORCE_PORTAL_TEST
+#define FORCE_PORTAL_TEST 0
+#endif
+#if FORCE_PORTAL_TEST
+  Serial.println(F("[TEST] FORCE portal — EEPROM WiFi KHONG bi xoa"));
+  startPortal();
+  return;
+#endif
+
+  // Chưa có WiFi / WiFi chỗ cũ không còn → portal (khách tự cấu hình, không cần nút)
+  if (wifiCount <= 0) {
     startPortal();
   } else {
-    Serial.println(F("Boot OK — WiFi co, bat MQTT"));
-    startMqttStack();
+    bool noSavedVisible = false;
+    bool ok = connectBestWifi(&noSavedVisible);
+    if (!ok && !noSavedVisible) {
+      // SSID còn thấy nhưng sai pass / yếu — thử thêm 1 lần
+      Serial.println(F("[WiFi] boot retry 1/1"));
+      delay(600);
+      ok = connectBestWifi(&noSavedVisible);
+    }
+    if (ok) {
+      Serial.println(F("Boot OK — WiFi co, bat MQTT"));
+      startMqttStack();
+    } else {
+      // Chuyển chỗ (không thấy SSID cũ): xóa WiFi chỗ cũ → portal cho khách
+      // Còn thấy SSID nhưng sai pass: giữ list, mở portal để nhập lại
+      openPortalForNewWifi(/*clearOldSaved=*/noSavedVisible);
+    }
   }
 }
 
 void loop() {
-  if (millis() > 4000) clearDoubleResetFlag();
-  handleBootButton();
-
   if (portalActive) {
     dnsServer.processNextRequest();
     webServer.handleClient();
+    // SoftAP ESP32 đôi khi tụt im — refresh định kỳ để khách không mất AP giữa chừng
+    static unsigned long lastApKeep = 0;
+    if (millis() - lastApKeep >= 8000) {
+      lastApKeep = millis();
+      if (WiFi.softAPgetStationNum() == 0) ensureSoftAP();
+    }
     if (millis() - lastOled >= OLED_MS) {
       lastOled = millis();
       drawOled();
@@ -820,24 +982,25 @@ void loop() {
   }
 
   unsigned long now = millis();
-  static uint32_t wifiDownSince = 0;
 
+  // Mất WiFi → thử lại; không thấy SSID đã lưu (đổi chỗ) → portal ngay
   if (WiFi.status() != WL_CONNECTED) {
-    if (wifiDownSince == 0) wifiDownSince = now;
-    // Debounce 5s — tránh WiFi status nháy làm cắt MQTT (OLED vẫn chạy, app kẹt retain)
-    if (now - wifiDownSince >= 5000) {
-      if (mqttStarted) stopMqttStack();
-      if (now - lastReconnect >= RECONNECT_MS) {
-        lastReconnect = now;
-        if (connectBestWifi()) {
-          wifiRetries = 0;
-          wifiDownSince = 0;
-          startMqttStack();
-        } else if (++wifiRetries >= 2) {
-          Serial.println(F("[WiFi] Mat mang — mo Portal de cau hinh lai"));
-          wifiRetries = 0;
-          startPortal();
-        }
+    if (mqttStarted) stopMqttStack();
+    if (now - lastReconnect >= RECONNECT_MS) {
+      lastReconnect = now;
+      bool noSavedVisible = false;
+      if (connectBestWifi(&noSavedVisible)) {
+        wifiRetries = 0;
+        startMqttStack();
+      } else if (noSavedVisible) {
+        // Đổi chỗ / WiFi cũ biến mất → portal ngay (không cần tắt nguồn)
+        Serial.println(F("[WiFi] Khong thay mang da luu — mo Portal cho khach"));
+        wifiRetries = 0;
+        openPortalForNewWifi(/*clearOldSaved=*/true);
+      } else {
+        // SSID vẫn thấy (mất sóng tạm) — chỉ thử lại, không kẹt portal
+        wifiRetries++;
+        Serial.printf("[WiFi] con SSID nhung fail — retry #%d\n", wifiRetries);
       }
     }
     if (now - tRead >= READ_MS) {
@@ -850,13 +1013,12 @@ void loop() {
     }
     return;
   }
-  wifiDownSince = 0;
   wifiRetries = 0;
 
   if (!mqttStarted) startMqttStack();
 
   wsClient.loop();
-  mqttClient.update();
+  if (mqttClient.isConnected()) mqttClient.update();
 
   if (!wssReady && wsClient.isConnected()) {
     wssReady = true;
@@ -865,8 +1027,9 @@ void loop() {
   }
   if (mqttStarted && !wsClient.isConnected()) wssReady = false;
 
-  if (wssReady && (mqttNeedConnect || !mqttClient.isConnected()) &&
-      now - lastMqttRetry >= 2500) {
+  // Luôn retry MQTT/WSS kể cả khi wssReady=false (sau fail err=-5)
+  if ((mqttNeedConnect || !mqttClient.isConnected()) &&
+      now - lastMqttRetry >= 3000) {
     lastMqttRetry = now;
     reconnectMQTT();
   }

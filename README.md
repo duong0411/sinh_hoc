@@ -11,6 +11,14 @@ Giám sát **nhiệt độ · độ ẩm · CO₂** trên OLED 1.3" (ESP32) và 
 | DHT11 DATA | GPIO 27 |
 | Nguồn | 3V3 / GND chung |
 
+## Tài liệu cho giáo viên / khách hàng
+
+Xem thư mục [`docs/`](docs/README.md):
+
+- [Hướng dẫn kết nối WiFi & app](docs/01-huong-dan-ket-noi.md)
+- [Bài giảng lớp cấp 2](docs/02-bai-giang.md)
+- [Sơ đồ mạch & nối dây](docs/03-so-do-mach.md)
+
 ## Firmware
 
 `firmware/AI_SinhHoc_ESP32/` — chipId MQTT: **`800`**
