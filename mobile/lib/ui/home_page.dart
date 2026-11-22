@@ -1,3 +1,5 @@
+import 'dart:ui';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:provider/provider.dart';
@@ -86,10 +88,10 @@ class HomePage extends StatelessWidget {
                       ),
                     ),
 
-                    // CO2 hero
+                    // CO2 hero — số cố định kích thước, tabular digits
                     SliverToBoxAdapter(
                       child: Padding(
-                        padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
+                        padding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
                         child: _Co2Hero(
                           ppm: bio.co2,
                           label: bio.co2Label,
@@ -97,10 +99,10 @@ class HomePage extends StatelessWidget {
                       ),
                     ),
 
-                    // Temp + Humi
+                    // Temp + Humi — cùng kiểu số lớn, đồng đều
                     SliverToBoxAdapter(
                       child: Padding(
-                        padding: const EdgeInsets.fromLTRB(24, 18, 24, 8),
+                        padding: const EdgeInsets.fromLTRB(24, 12, 24, 8),
                         child: Row(
                           children: [
                             Expanded(
@@ -113,7 +115,7 @@ class HomePage extends StatelessWidget {
                                 accent: BioTheme.warn,
                               ),
                             ),
-                            const SizedBox(width: 14),
+                            const SizedBox(width: 12),
                             Expanded(
                               child: _MetricTile(
                                 title: 'Độ ẩm',
@@ -129,7 +131,6 @@ class HomePage extends StatelessWidget {
                       ),
                     ),
 
-                    // Charts
                     SliverToBoxAdapter(
                       child: Padding(
                         padding: const EdgeInsets.fromLTRB(24, 20, 24, 40),
@@ -153,6 +154,43 @@ class HomePage extends StatelessWidget {
       decoration: BoxDecoration(
         shape: BoxShape.circle,
         color: color,
+      ),
+    );
+  }
+}
+
+/// Số cảm biến: cùng font, tabular figures → "550" / "1200" không nhảy to–bé.
+class _SensorNumber extends StatelessWidget {
+  const _SensorNumber({
+    required this.text,
+    required this.fontSize,
+    this.color = BioTheme.cream,
+    this.maxLines = 1,
+  });
+
+  final String text;
+  final double fontSize;
+  final Color color;
+  final int maxLines;
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      text,
+      maxLines: maxLines,
+      overflow: TextOverflow.visible,
+      softWrap: false,
+      style: TextStyle(
+        fontFamily: 'Georgia',
+        fontSize: fontSize,
+        height: 1.0,
+        fontWeight: FontWeight.w700,
+        letterSpacing: 0.5,
+        color: color,
+        fontFeatures: const [
+          FontFeature.tabularFigures(),
+          FontFeature.liningFigures(),
+        ],
       ),
     );
   }
@@ -244,6 +282,8 @@ class _Co2Hero extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final text = ppm == null ? '----' : ppm!.toStringAsFixed(0);
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -256,34 +296,40 @@ class _Co2Hero extends StatelessWidget {
             color: BioTheme.co2.withValues(alpha: 0.9),
           ),
         ),
-        const SizedBox(height: 10),
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            Text(
-              ppm == null ? '----' : ppm!.toStringAsFixed(0),
-              style: const TextStyle(
-                fontFamily: 'Georgia',
-                fontSize: 72,
-                height: 0.95,
-                fontWeight: FontWeight.w700,
-                color: BioTheme.cream,
-              ),
-            ),
-            const SizedBox(width: 8),
-            Padding(
-              padding: const EdgeInsets.only(bottom: 12),
-              child: Text(
-                'ppm',
-                style: TextStyle(
-                  fontSize: 18,
-                  color: BioTheme.soft.withValues(alpha: 0.8),
+        const SizedBox(height: 14),
+        // Chiều cao cố định — 3 chữ số (550) và 4 chữ số (1200) cùng cỡ nhìn
+        SizedBox(
+          height: 78,
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Flexible(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.bottomLeft,
+                  child: _SensorNumber(
+                    text: text,
+                    fontSize: 68,
+                    color: BioTheme.cream,
+                  ),
                 ),
               ),
-            ),
-          ],
+              const SizedBox(width: 10),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Text(
+                  'ppm',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w600,
+                    color: BioTheme.soft.withValues(alpha: 0.85),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
-        const SizedBox(height: 10),
+        const SizedBox(height: 12),
         Text(
           label,
           style: TextStyle(
@@ -323,7 +369,7 @@ class _MetricTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 18),
+      padding: const EdgeInsets.fromLTRB(14, 14, 14, 16),
       decoration: BoxDecoration(
         border: Border(
           left: BorderSide(color: accent.withValues(alpha: 0.85), width: 3),
@@ -341,32 +387,37 @@ class _MetricTile extends StatelessWidget {
               color: accent.withValues(alpha: 0.9),
             ),
           ),
-          const SizedBox(height: 10),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Text(
-                value,
-                style: const TextStyle(
-                  fontFamily: 'Georgia',
-                  fontSize: 36,
-                  height: 1,
-                  fontWeight: FontWeight.w700,
-                  color: BioTheme.cream,
-                ),
-              ),
-              const SizedBox(width: 4),
-              Padding(
-                padding: const EdgeInsets.only(bottom: 4),
-                child: Text(
-                  unit,
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: BioTheme.soft.withValues(alpha: 0.8),
+          const SizedBox(height: 12),
+          SizedBox(
+            height: 48,
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Flexible(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.bottomLeft,
+                    child: _SensorNumber(
+                      text: value,
+                      fontSize: 44,
+                      color: BioTheme.cream,
+                    ),
                   ),
                 ),
-              ),
-            ],
+                const SizedBox(width: 6),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Text(
+                    unit,
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                      color: BioTheme.soft.withValues(alpha: 0.85),
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),

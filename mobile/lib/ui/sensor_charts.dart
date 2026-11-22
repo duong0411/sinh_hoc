@@ -1,3 +1,5 @@
+import 'dart:ui';
+
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 
@@ -193,9 +195,14 @@ class _ChartCard extends StatelessWidget {
                 display == null ? '-- $unit' : '${_fmt(display)} $unit',
                 style: TextStyle(
                   fontFamily: 'Georgia',
-                  fontSize: 16,
+                  fontSize: 18,
                   fontWeight: FontWeight.w700,
+                  letterSpacing: 0.4,
                   color: color,
+                  fontFeatures: const [
+                    FontFeature.tabularFigures(),
+                    FontFeature.liningFigures(),
+                  ],
                 ),
               ),
             ],
